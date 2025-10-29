@@ -95,73 +95,72 @@ def qreader_detect_parallel(frame, qreader, results_queue):
 # PyZbar 함수 제거됨
 
 def brightness_qreader_detect_parallel(frame, qreader, results_queue):
-    """밝기향상+QReader 탐지 (병렬 처리용)"""
+    """밝기향상+QReader 탐지 (병렬 처리용, 파라미터 스윕)"""
     try:
-        brightened = cv2.convertScaleAbs(frame, alpha=1.5, beta=30)
-        detections = qreader.detect(brightened)
-        
-        if detections and len(detections) > 0:
-            results = []
-            for i, detection in enumerate(detections):
-                try:
-                    decoded_text = qreader.decode(brightened, detection)
-                    if decoded_text:
-                        # 특수 문자 처리
-                        decoded_text = decoded_text.replace('–', '-')
-                        decoded_text = decoded_text.replace('—', '-')
-                        
-                        # 한글 인코딩 처리
-                        try:
-                            if isinstance(decoded_text, bytes):
-                                decoded_text = decoded_text.decode('utf-8')
-                        except UnicodeDecodeError:
-                            try:
-                                decoded_text = decoded_text.decode('cp949')
-                            except:
-                                decoded_text = str(decoded_text)
-                        
-                        results.append({
-                            'text': decoded_text,
-                            'detection': detection,
-                            'method': f'밝기향상+QReader-{i+1}',
-                            'success': True
-                        })
-                    else:
-                        results.append({
-                            'text': '해독 실패',
-                            'detection': detection,
-                            'method': f'밝기향상+QReader-{i+1}-실패',
-                            'success': False
-                        })
-                except Exception as e:
-                    continue
-            
-            if results:
-                results_queue.put(('밝기향상+QReader', results))
-    except Exception as e:
+        params = [(1.3, 20), (1.5, 30), (1.7, 40)]
+        aggregate = []
+        for alpha, beta in params:
+            bright = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
+            bright = cv2.medianBlur(bright, 3)
+            detections = qreader.detect(bright)
+            if detections and len(detections) > 0:
+                for i, detection in enumerate(detections):
+                    try:
+                        decoded_text = qreader.decode(bright, detection)
+                        decoded_text = _process_decoded_text(decoded_text)
+                        if decoded_text:
+                            aggregate.append({'text': decoded_text,'detection': detection,'method': f'밝기향상+QReader-{i+1}','success': True})
+                        else:
+                            aggregate.append({'text': '해독 실패','detection': detection,'method': f'밝기향상+QReader-{i+1}-실패','success': False})
+                    except Exception:
+                        continue
+        if aggregate:
+            results_queue.put(('밝기향상+QReader', aggregate))
+    except Exception:
         pass
 
 def clahe_qreader_detect_parallel(frame, qreader, results_queue):
-    """CLAHE+QReader 탐지 (병렬 처리용)"""
+    """CLAHE+QReader 탐지 (병렬 처리용, 파라미터 스윕)"""
     try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        
-        detections = qreader.detect(enhanced_bgr)
-        
+        clip_limits = [2.0, 3.0]
+        tiles = [(8, 8), (12, 12)]
+        aggregate = []
+        for cl in clip_limits:
+            for ts in tiles:
+                clahe = cv2.createCLAHE(clipLimit=cl, tileGridSize=ts)
+                enhanced = clahe.apply(gray)
+                enhanced = cv2.medianBlur(enhanced, 3)
+                enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                detections = qreader.detect(enhanced_bgr)
+                if detections and len(detections) > 0:
+                    for i, detection in enumerate(detections):
+                        try:
+                            decoded_text = qreader.decode(enhanced_bgr, detection)
+                            decoded_text = _process_decoded_text(decoded_text)
+                            if decoded_text:
+                                aggregate.append({'text': decoded_text,'detection': detection,'method': f'CLAHE+QReader-{i+1}','success': True})
+                            else:
+                                aggregate.append({'text': '해독 실패','detection': detection,'method': f'CLAHE+QReader-{i+1}-실패','success': False})
+                        except Exception:
+                            continue
+        if aggregate:
+            results_queue.put(('CLAHE+QReader', aggregate))
+    except Exception as e:
+        pass
+
+# 반전+QReader (흰색 QR용)
+def inverted_qreader_detect_parallel(frame, qreader, results_queue):
+    try:
+        inverted = cv2.bitwise_not(frame)
+        detections = qreader.detect(inverted)
         if detections and len(detections) > 0:
             results = []
             for i, detection in enumerate(detections):
                 try:
-                    decoded_text = qreader.decode(enhanced_bgr, detection)
+                    decoded_text = qreader.decode(inverted, detection)
                     if decoded_text:
-                        # 특수 문자 처리
-                        decoded_text = decoded_text.replace('–', '-')
-                        decoded_text = decoded_text.replace('—', '-')
-                        
-                        # 한글 인코딩 처리
+                        decoded_text = decoded_text.replace('–', '-').replace('—', '-')
                         try:
                             if isinstance(decoded_text, bytes):
                                 decoded_text = decoded_text.decode('utf-8')
@@ -170,28 +169,122 @@ def clahe_qreader_detect_parallel(frame, qreader, results_queue):
                                 decoded_text = decoded_text.decode('cp949')
                             except:
                                 decoded_text = str(decoded_text)
-                        
                         results.append({
                             'text': decoded_text,
                             'detection': detection,
-                            'method': f'CLAHE+QReader-{i+1}',
+                            'method': f'Inverted+QReader-{i+1}',
                             'success': True
                         })
                     else:
                         results.append({
                             'text': '해독 실패',
                             'detection': detection,
-                            'method': f'CLAHE+QReader-{i+1}-실패',
+                            'method': f'Inverted+QReader-{i+1}-실패',
                             'success': False
                         })
-                except Exception as e:
+                except Exception:
                     continue
-            
             if results:
-                results_queue.put(('CLAHE+QReader', results))
-    except Exception as e:
+                results_queue.put(('Inverted+QReader', results))
+    except Exception:
         pass
 
+# 원본 이진화+QReader
+def binary_qreader_detect_parallel(frame, qreader, results_queue):
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        aggregate = []
+        blurs = [0, 3]
+        blocks = [11, 15, 21]
+        consts = [2, 5, 10]
+        for k in blurs:
+            src = cv2.medianBlur(gray, k) if k else gray
+            for b in blocks:
+                for c in consts:
+                    try:
+                        binary = cv2.adaptiveThreshold(src, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, b, c)
+                        binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+                        detections = qreader.detect(binary_bgr)
+                        if detections and len(detections) > 0:
+                            for i, detection in enumerate(detections):
+                                try:
+                                    decoded_text = qreader.decode(binary_bgr, detection)
+                                    if decoded_text:
+                                        aggregate.append({'text': decoded_text,'detection': detection,'method': f'Binary+QReader-{i+1}','success': True})
+                                    else:
+                                        aggregate.append({'text': '해독 실패','detection': detection,'method': f'Binary+QReader-{i+1}-실패','success': False})
+                                except Exception:
+                                    continue
+                    except Exception:
+                        continue
+        if aggregate:
+            results_queue.put(('Binary+QReader', aggregate))
+    except Exception:
+        pass
+
+# 반전+CLAHE+QReader
+def inverted_clahe_qreader_detect_parallel(frame, qreader, results_queue):
+    try:
+        inverted = cv2.bitwise_not(frame)
+        gray = cv2.cvtColor(inverted, cv2.COLOR_BGR2GRAY)
+        clip_limits = [2.0, 3.0]
+        tiles = [(8, 8), (12, 12)]
+        aggregate = []
+        for cl in clip_limits:
+            for ts in tiles:
+                clahe = cv2.createCLAHE(clipLimit=cl, tileGridSize=ts)
+                enhanced = clahe.apply(gray)
+                enhanced = cv2.medianBlur(enhanced, 3)
+                enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                detections = qreader.detect(enhanced_bgr)
+                if detections and len(detections) > 0:
+                    for i, detection in enumerate(detections):
+                        try:
+                            decoded_text = qreader.decode(enhanced_bgr, detection)
+                            if decoded_text:
+                                aggregate.append({'text': decoded_text,'detection': detection,'method': f'Inverted+CLAHE+QReader-{i+1}','success': True})
+                            else:
+                                aggregate.append({'text': '해독 실패','detection': detection,'method': f'Inverted+CLAHE+QReader-{i+1}-실패','success': False})
+                        except Exception:
+                            continue
+        if aggregate:
+            results_queue.put(('Inverted+CLAHE+QReader', aggregate))
+    except Exception:
+        pass
+
+# 반전+이진화+QReader
+def inverted_binary_qreader_detect_parallel(frame, qreader, results_queue):
+    try:
+        inverted = cv2.bitwise_not(frame)
+        gray = cv2.cvtColor(inverted, cv2.COLOR_BGR2GRAY)
+        aggregate = []
+        blurs = [0, 3]
+        blocks = [11, 15, 21]
+        consts = [2, 5, 10]
+        for k in blurs:
+            src = cv2.medianBlur(gray, k) if k else gray
+            for b in blocks:
+                for c in consts:
+                    try:
+                        binary = cv2.adaptiveThreshold(src, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, b, c)
+                        binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+                        detections = qreader.detect(binary_bgr)
+                        if detections and len(detections) > 0:
+                            for i, detection in enumerate(detections):
+                                try:
+                                    decoded_text = qreader.decode(binary_bgr, detection)
+                                    if decoded_text:
+                                        aggregate.append({'text': decoded_text,'detection': detection,'method': f'Inverted+Binary+QReader-{i+1}','success': True})
+                                    else:
+                                        aggregate.append({'text': '해독 실패','detection': detection,'method': f'Inverted+Binary+QReader-{i+1}-실패','success': False})
+                                except Exception:
+                                    continue
+                    except Exception:
+                        continue
+        if aggregate:
+            results_queue.put(('Inverted+Binary+QReader', aggregate))
+    except Exception:
+        pass
 # 밝기향상+PyZbar 함수 제거됨
 
 def process_frame_parallel(frame, qreader):
@@ -199,11 +292,15 @@ def process_frame_parallel(frame, qreader):
     results_queue = queue.Queue()
     threads = []
     
-    # 3개 방법을 동시에 실행 (PyZbar 관련 제거)
+    # 여러 방법을 동시에 실행 (반전/이진화 계열 포함)
     if qreader:
         threads.append(threading.Thread(target=qreader_detect_parallel, args=(frame, qreader, results_queue)))
         threads.append(threading.Thread(target=brightness_qreader_detect_parallel, args=(frame, qreader, results_queue)))
         threads.append(threading.Thread(target=clahe_qreader_detect_parallel, args=(frame, qreader, results_queue)))
+        threads.append(threading.Thread(target=inverted_qreader_detect_parallel, args=(frame, qreader, results_queue)))
+        threads.append(threading.Thread(target=binary_qreader_detect_parallel, args=(frame, qreader, results_queue)))
+        threads.append(threading.Thread(target=inverted_clahe_qreader_detect_parallel, args=(frame, qreader, results_queue)))
+        threads.append(threading.Thread(target=inverted_binary_qreader_detect_parallel, args=(frame, qreader, results_queue)))
     
     # 모든 스레드 시작
     for thread in threads:
@@ -285,7 +382,11 @@ def get_english_method_name(method_name):
     method_map = {
         "QReader": "QReader",
         "밝기향상+QReader": "Bright+QReader",
-        "CLAHE+QReader": "CLAHE+QReader"
+        "CLAHE+QReader": "CLAHE+QReader",
+        "Inverted+QReader": "Inverted+QReader",
+        "Binary+QReader": "Binary+QReader",
+        "Inverted+CLAHE+QReader": "Inverted+CLAHE+QReader",
+        "Inverted+Binary+QReader": "Inverted+Binary+QReader"
     }
     return method_map.get(method_name, method_name)
 
@@ -522,20 +623,32 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     method_stats = {
         "QReader": 0,
         "밝기향상+QReader": 0,
-        "CLAHE+QReader": 0
+        "CLAHE+QReader": 0,
+        "Inverted+QReader": 0,
+        "Binary+QReader": 0,
+        "Inverted+CLAHE+QReader": 0,
+        "Inverted+Binary+QReader": 0
     }
     
     # 테스트용: 방법별 탐지 개수 및 고유 탐지 추적
     method_detection_count = {
         "QReader": 0,
         "밝기향상+QReader": 0,
-        "CLAHE+QReader": 0
+        "CLAHE+QReader": 0,
+        "Inverted+QReader": 0,
+        "Binary+QReader": 0,
+        "Inverted+CLAHE+QReader": 0,
+        "Inverted+Binary+QReader": 0
     }
     
     method_unique_detection_count = {
         "QReader": 0,
         "밝기향상+QReader": 0,
-        "CLAHE+QReader": 0
+        "CLAHE+QReader": 0,
+        "Inverted+QReader": 0,
+        "Binary+QReader": 0,
+        "Inverted+CLAHE+QReader": 0,
+        "Inverted+Binary+QReader": 0
     }
     
     # 모든 방법에서 찾은 QR 코드들을 저장 (중복 제거용)
