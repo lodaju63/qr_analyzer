@@ -34,6 +34,14 @@ except ImportError:
     QREADER_AVAILABLE = False
     print("⚠️ QReader를 사용할 수 없습니다. pip install qreader로 설치하세요.")
 
+# YOLO 모델 import
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("⚠️ ultralytics를 사용할 수 없습니다. pip install ultralytics로 설치하세요.")
+
 # PyZbar 관련 코드 제거됨
 PYZBAR_AVAILABLE = False
 
@@ -259,8 +267,184 @@ def inverted_clahe_qreader_detect_parallel(frame, qreader, results_queue):
 # Inverted+Binary+QReader 방법 제거됨 (성능상 이점 없음)
 # 밝기향상+PyZbar 함수 제거됨
 
+def apply_clahe(img, clip_limit=3.0, tile_grid_size=(3, 3)):
+    """CLAHE 전처리 적용"""
+    try:
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        enhanced = clahe.apply(gray)
+        enhanced = cv2.medianBlur(enhanced, 3)
+        if len(img.shape) == 3:
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        return enhanced
+    except Exception:
+        return img
+
+def yolo_detect_qr_locations(model, frame, conf_threshold=0.25):
+    """YOLO 모델로 QR 코드 위치 빠르게 탐지"""
+    try:
+        results = model(frame, conf=conf_threshold, verbose=False)
+        result = results[0]
+        
+        locations = []
+        if result.boxes is not None and len(result.boxes) > 0:
+            for box in result.boxes:
+                conf = float(box.conf[0])
+                xyxy = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = map(int, xyxy)
+                
+                # 패딩 추가 (QR 코드 경계 확보)
+                pad = 20
+                h, w = frame.shape[:2]
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+                
+                locations.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': conf
+                })
+        
+        return locations
+    except Exception as e:
+        return []
+
+def decode_roi_parallel(roi, qreader, bbox, results_queue, method_name="YOLO+QReader"):
+    """ROI 영역에서 QR 코드 해독 (병렬 처리용)"""
+    try:
+        # ROI에서 detect 먼저 실행 (더 정확한 위치 찾기)
+        detections = qreader.detect(roi)
+        
+        if detections and len(detections) > 0:
+            # 첫 번째 detection 사용
+            detection = detections[0]
+            decoded_text = qreader.decode(roi, detection)
+        else:
+            # detect 실패 시 ROI 전체에서 직접 decode 시도
+            decoded_text = qreader.decode(roi)
+            detection = None
+        
+        if decoded_text:
+            decoded_text = _process_decoded_text(decoded_text)
+            if decoded_text:
+                # 원본 이미지 좌표로 변환
+                x1, y1, x2, y2 = bbox
+                
+                if detection and 'quad_xy' in detection:
+                    # ROI 내 좌표를 원본 이미지 좌표로 변환
+                    roi_h, roi_w = roi.shape[:2]
+                    quad_xy = []
+                    for qx, qy in detection['quad_xy']:
+                        # ROI 내 상대 좌표를 원본 이미지 절대 좌표로 변환
+                        abs_x = x1 + int(qx)
+                        abs_y = y1 + int(qy)
+                        quad_xy.append([abs_x, abs_y])
+                    
+                    detection_result = {
+                        'bbox_xyxy': [x1, y1, x2, y2],
+                        'quad_xy': quad_xy
+                    }
+                else:
+                    # detection 정보가 없으면 bbox 기반으로 생성
+                    detection_result = {
+                        'bbox_xyxy': [x1, y1, x2, y2],
+                        'quad_xy': [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                    }
+                
+                results_queue.put((method_name, [{
+                    'text': decoded_text,
+                    'detection': detection_result,
+                    'method': method_name,
+                    'success': True
+                }]))
+                return
+    except Exception:
+        pass
+
+def decode_roi_with_preprocessing_parallel(roi, qreader, bbox, results_queue, method_name, preprocessing_func):
+    """전처리된 ROI에서 QR 코드 해독 (병렬 처리용)"""
+    try:
+        processed_roi = preprocessing_func(roi)
+        if processed_roi is not None:
+            decode_roi_parallel(processed_roi, qreader, bbox, results_queue, method_name)
+    except Exception:
+        pass
+
+def process_frame_with_yolo(frame, yolo_model, qreader, conf_threshold=0.25, use_preprocessing=False):
+    """YOLO로 빠르게 위치 찾고, ROI에서만 해독하는 최적화된 처리
+    
+    Args:
+        frame: 입력 프레임
+        yolo_model: YOLO 모델
+        qreader: QReader 인스턴스
+        conf_threshold: YOLO 신뢰도 임계값
+        use_preprocessing: 전처리 방법 사용 여부 (False면 원본만 사용, 속도 향상)
+    """
+    results_queue = queue.Queue()
+    threads = []
+    
+    # 1단계: YOLO로 빠르게 QR 코드 위치 탐지
+    if yolo_model is not None:
+        qr_locations = yolo_detect_qr_locations(yolo_model, frame, conf_threshold)
+        
+        if qr_locations:
+            # 2단계: 각 ROI에서 병렬로 해독 시도
+            for i, location in enumerate(qr_locations):
+                x1, y1, x2, y2 = location['bbox']
+                roi = frame[y1:y2, x1:x2]
+                
+                if roi.size == 0:
+                    continue
+                
+                # 원본 ROI 해독 (항상 실행)
+                if qreader:
+                    threads.append(threading.Thread(
+                        target=decode_roi_parallel,
+                        args=(roi, qreader, location['bbox'], results_queue, f"YOLO+QReader-{i+1}")
+                    ))
+                    
+                    # 전처리된 ROI 해독 (옵션, 원본 실패 시에만 유용)
+                    # 성능 최적화: 전처리 방법 제거 (원본이 이미 100% 성공률)
+                    if use_preprocessing:
+                        threads.append(threading.Thread(
+                            target=decode_roi_with_preprocessing_parallel,
+                            args=(roi, qreader, location['bbox'], results_queue, 
+                                  f"YOLO+밝기향상+QReader-{i+1}",
+                                  lambda img: cv2.convertScaleAbs(img, alpha=1.3, beta=15))
+                        ))
+                        
+                        threads.append(threading.Thread(
+                            target=decode_roi_with_preprocessing_parallel,
+                            args=(roi, qreader, location['bbox'], results_queue,
+                                  f"YOLO+CLAHE+QReader-{i+1}",
+                                  lambda img: apply_clahe(img))
+                        ))
+        
+        # 모든 스레드 시작
+        for thread in threads:
+            thread.start()
+        
+        # 모든 스레드 완료 대기
+        for thread in threads:
+            thread.join()
+        
+        # 결과 수집
+        all_results = {}
+        while not results_queue.empty():
+            method, results = results_queue.get()
+            all_results[method] = results
+        
+        return all_results
+    
+    # YOLO 모델이 없으면 기존 방식 사용
+    return process_frame_parallel(frame, qreader)
+
 def process_frame_parallel(frame, qreader):
-    """프레임을 병렬로 처리하여 모든 QR 탐지 방법 실행"""
+    """프레임을 병렬로 처리하여 모든 QR 탐지 방법 실행 (기존 방식)"""
     results_queue = queue.Queue()
     threads = []
     
@@ -652,17 +836,40 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     # QR 탐지기 초기화
     detector = cv2.QRCodeDetector()
     
+    # YOLO 모델 초기화
+    yolo_model = None
+    use_yolo_mode = True  # YOLO 모드 사용 여부
+    
+    if YOLO_AVAILABLE and use_yolo_mode:
+        try:
+            model_path = 'l.pt'
+            if os.path.exists(model_path):
+                yolo_model = YOLO(model_path)
+                log_print("✅ YOLO 모델 초기화 완료 (빠른 탐지 모드)")
+                log_print(f"   모델: {model_path}")
+            else:
+                log_print(f"⚠️ YOLO 모델 파일을 찾을 수 없습니다: {model_path}")
+                log_print("   기존 방식으로 전환합니다.")
+                use_yolo_mode = False
+        except Exception as e:
+            log_print(f"❌ YOLO 모델 초기화 실패: {e}")
+            log_print("   기존 방식으로 전환합니다.")
+            use_yolo_mode = False
+    else:
+        use_yolo_mode = False
+    
     # QReader 초기화
     qreader = None
     if QREADER_AVAILABLE:
         try:
             qreader = QReader()
-            print("✅ QReader 초기화 완료")
+            log_print("✅ QReader 초기화 완료")
         except Exception as e:
-            print(f"❌ QReader 초기화 실패: {e}")
+            log_print(f"❌ QReader 초기화 실패: {e}")
             qreader = None
     
     log_print(f"📊 사용 가능한 탐지기:")
+    log_print(f"  - YOLO 모델: {'✅ (빠른 탐지 모드)' if yolo_model else '❌'}")
     log_print(f"  - OpenCV: ❌")
     log_print(f"  - QReader: {'✅' if qreader else '❌'}")
     log_print(f"  - PyZbar: ❌ (제거됨)")
@@ -713,208 +920,8 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     fps_start_time = time.time()
     
     # 탐지 간격 설정 (성능 향상)
-    detection_interval = 1  # 매 프레임 탐지(비동기 유지)
+    detection_interval = 5  # 5프레임마다 탐지
     last_detection_frame = 0
-
-    # 1단계: 캡처/표시-탐지 분리 (최신 프레임만 탐지)
-    import threading, queue
-    use_async_detection = True
-    frame_queue: 'queue.Queue[np.ndarray]' = queue.Queue(maxsize=1)
-    latest_unique_qrs = []
-    last_success_qrs = []  # 최근 성공 결과 캐시(깜빡임 완화)
-    async_running = True
-    async_enq_count = 0
-    async_det_count = 0
-    worker_heartbeat = 0.0
-    last_overlay_error_time = 0.0
-    last_debug_dump_time = 0.0
-
-    # 간단 추적기(KCF/CSRT)
-    tracker = None
-    tracker_active = False
-    roi_bbox = None  # (x1, y1, x2, y2) 원본 해상도 기준
-
-    def _create_tracker():
-        try:
-            return cv2.legacy.TrackerCSRT_create()
-        except Exception:
-            try:
-                return cv2.TrackerCSRT_create()
-            except Exception:
-                try:
-                    return cv2.legacy.TrackerKCF_create()
-                except Exception:
-                    return cv2.TrackerKCF_create()
-
-    def detection_worker():
-        nonlocal latest_unique_qrs, async_det_count, worker_heartbeat
-        # 워커 전용 QReader 인스턴스 사용(스레드 안전성 확보)
-        worker_qreader = None
-        try:
-            if QREADER_AVAILABLE:
-                worker_qreader = QReader()
-                log_print("✅ 워커 QReader 초기화 완료")
-        except Exception as e:
-            log_print(f"❌ 워커 QReader 초기화 실패: {e}")
-            worker_qreader = None
-        # OpenCV 기본 디텍터(폴백)
-        worker_detector = cv2.QRCodeDetector()
-        worker_heartbeat = time.time()
-        consecutive_fast_fail = 0
-
-        def run_qreader_once(img_bgr, tag):
-            try:
-                dets = worker_qreader.detect(img_bgr) if worker_qreader else []
-            except Exception:
-                dets = []
-            out = []
-            if dets:
-                for i, det in enumerate(dets):
-                    try:
-                        txt = worker_qreader.decode(img_bgr, det)
-                        if txt:
-                            out.append({'text': txt, 'detection': det, 'method': f'{tag}-{i+1}', 'success': True})
-                        else:
-                            out.append({'text': '', 'detection': det, 'method': f'{tag}-{i+1}-실패', 'success': False})
-                    except Exception:
-                        continue
-            return out
-
-        def fast_detect(src_bgr):
-            # ROI 우선
-            if roi_bbox is not None:
-                x1, y1, x2, y2 = [int(v) for v in roi_bbox]
-                x1 = max(0, min(x1, src_bgr.shape[1]-1)); x2 = max(0, min(x2, src_bgr.shape[1]-1))
-                y1 = max(0, min(y1, src_bgr.shape[0]-1)); y2 = max(0, min(y2, src_bgr.shape[0]-1))
-                if x2 > x1 and y2 > y1:
-                    roi = src_bgr[y1:y2, x1:x2].copy()
-                else:
-                    roi = src_bgr
-            else:
-                roi = src_bgr
-
-            # 우선순위 소수 조합만 시도
-            # 1) 원본
-            out = run_qreader_once(roi, 'QReader')
-            if any(o.get('success') for o in out):
-                # ROI 보정
-                if roi is not src_bgr and roi_bbox is not None:
-                    for o in out:
-                        d = o.get('detection')
-                        if isinstance(d, dict) and 'points' in d:
-                            pts = d['points']
-                            d['points'] = [(p[0]+roi_bbox[0], p[1]+roi_bbox[1]) for p in pts]
-                return out
-
-            # 2) 밝기 (1.3,15)
-            try:
-                bright = cv2.convertScaleAbs(roi, alpha=1.3, beta=15)
-                bright = cv2.medianBlur(bright, 3)
-                out = run_qreader_once(bright, '밝기향상+QReader')
-                if any(o.get('success') for o in out):
-                    if roi is not src_bgr and roi_bbox is not None:
-                        for o in out:
-                            d = o.get('detection')
-                            if isinstance(d, dict) and 'points' in d:
-                                pts = d['points']
-                                d['points'] = [(p[0]+roi_bbox[0], p[1]+roi_bbox[1]) for p in pts]
-                    return out
-            except Exception:
-                pass
-
-            # 3) CLAHE (5.0, 2x2)
-            try:
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(2,2))
-                enh = clahe.apply(gray)
-                enh = cv2.medianBlur(enh, 3)
-                enh_bgr = cv2.cvtColor(enh, cv2.COLOR_GRAY2BGR)
-                out = run_qreader_once(enh_bgr, 'CLAHE+QReader')
-                if any(o.get('success') for o in out):
-                    if roi is not src_bgr and roi_bbox is not None:
-                        for o in out:
-                            d = o.get('detection')
-                            if isinstance(d, dict) and 'points' in d:
-                                pts = d['points']
-                                d['points'] = [(p[0]+roi_bbox[0], p[1]+roi_bbox[1]) for p in pts]
-                    return out
-            except Exception:
-                pass
-
-            # 4) Inverted+CLAHE (5.0, 2x2)
-            try:
-                inv = cv2.bitwise_not(roi)
-                gray = cv2.cvtColor(inv, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(2,2))
-                enh = clahe.apply(gray)
-                enh = cv2.medianBlur(enh, 3)
-                enh_bgr = cv2.cvtColor(enh, cv2.COLOR_GRAY2BGR)
-                out = run_qreader_once(enh_bgr, 'Inverted+CLAHE+QReader')
-                if any(o.get('success') for o in out):
-                    if roi is not src_bgr and roi_bbox is not None:
-                        for o in out:
-                            d = o.get('detection')
-                            if isinstance(d, dict) and 'points' in d:
-                                pts = d['points']
-                                d['points'] = [(p[0]+roi_bbox[0], p[1]+roi_bbox[1]) for p in pts]
-                    return out
-            except Exception:
-                pass
-
-            # 폴백 OpenCV
-            try:
-                retval, decoded_infos, points, _ = worker_detector.detectAndDecodeMulti(roi)
-            except Exception:
-                retval, decoded_infos, points = False, [], None
-            out = []
-            if retval and points is not None:
-                for i, quad in enumerate(points):
-                    txt = decoded_infos[i] if i < len(decoded_infos) else ''
-                    det = {'points': [(int(p[0]), int(p[1])) for p in quad.reshape(-1,2)]}
-                    out.append({'text': txt or '', 'detection': det, 'method': 'OpenCV-QR', 'success': bool(txt)})
-                if roi is not src_bgr and roi_bbox is not None:
-                    for o in out:
-                        d = o.get('detection')
-                        pts = d.get('points')
-                        if pts:
-                            d['points'] = [(p[0]+roi_bbox[0], p[1]+roi_bbox[1]) for p in pts]
-            return out
-        while async_running:
-            try:
-                src = frame_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                single_frame, _ = create_single_frame(src)
-                latest_unique_qrs = fast_detect(single_frame)
-                # 성공 여부에 따라 캐시/리커버리
-                if any((isinstance(o, dict) and o.get('success')) for o in (latest_unique_qrs or [])):
-                    last_success_qrs = latest_unique_qrs
-                    consecutive_fast_fail = 0
-                else:
-                    consecutive_fast_fail += 1
-                    # 리커버리: 빠른 경로 연속 실패 시 1회 전체 스윕
-                    if consecutive_fast_fail >= 10:
-                        try:
-                            results_full = process_frame_parallel(single_frame, worker_qreader)
-                            recovered = process_single_results(results_full)
-                            latest_unique_qrs = recovered
-                            if any((isinstance(o, dict) and o.get('success')) for o in (recovered or [])):
-                                last_success_qrs = recovered
-                                consecutive_fast_fail = 0
-                        except Exception:
-                            pass
-            except Exception as e:
-                log_print(f"  ❌ 비동기 탐지 오류: {e}")
-                import traceback
-                log_print(traceback.format_exc())
-            finally:
-                async_det_count += 1
-                worker_heartbeat = time.time()
-
-    if use_async_detection:
-        detect_thread = threading.Thread(target=detection_worker, daemon=True)
-        detect_thread.start()
     
     # 통계 변수
     success_count = 0
@@ -922,6 +929,9 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     
     # 방법별 성공률 추적 (테스트용 확장)
     method_stats = {
+        "YOLO+QReader": 0,
+        "YOLO+밝기향상+QReader": 0,
+        "YOLO+CLAHE+QReader": 0,
         "QReader": 0,
         "밝기향상+QReader": 0,
         "CLAHE+QReader": 0,
@@ -931,6 +941,9 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     
     # 테스트용: 방법별 탐지 개수 및 고유 탐지 추적
     method_detection_count = {
+        "YOLO+QReader": 0,
+        "YOLO+밝기향상+QReader": 0,
+        "YOLO+CLAHE+QReader": 0,
         "QReader": 0,
         "밝기향상+QReader": 0,
         "CLAHE+QReader": 0,
@@ -939,6 +952,9 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     }
     
     method_unique_detection_count = {
+        "YOLO+QReader": 0,
+        "YOLO+밝기향상+QReader": 0,
+        "YOLO+CLAHE+QReader": 0,
         "QReader": 0,
         "밝기향상+QReader": 0,
         "CLAHE+QReader": 0,
@@ -980,16 +996,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
             
             # 프레임 스킵/처리 콘솔 출력 제거
             
-            # 워커 상태 점검
-            worker_dead = False
-            if use_async_detection:
-                try:
-                    if not detect_thread.is_alive() or (worker_heartbeat == 0.0) or ((time.time() - worker_heartbeat) > 1.0):
-                        worker_dead = True
-                except Exception:
-                    worker_dead = True
-
-            if should_detect and not use_async_detection:
+            if should_detect:
                 # 현재 프레임용 변수 초기화
                 current_success = 0
                 current_failed = 0
@@ -1001,8 +1008,16 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                     # 원본 프레임만 사용
                     single_frame, scales = create_single_frame(frame)
                     
-                    # 병렬 처리
-                    results = process_frame_parallel(single_frame, qreader)
+                    # YOLO 모드 사용 여부에 따라 처리 방식 선택
+                    if use_yolo_mode and yolo_model is not None:
+                        # 🚀 YOLO 기반 빠른 탐지 + ROI 해독
+                        # use_preprocessing=False: 전처리 방법 제거로 속도 향상 (원본이 100% 성공률)
+                        # use_preprocessing=True: 전처리 방법 활성화 (원본 실패 시 추가 시도)
+                        use_preprocessing_mode = False  # True로 변경하면 전처리 방법 활성화
+                        results = process_frame_with_yolo(single_frame, yolo_model, qreader, conf_threshold=0.25, use_preprocessing=use_preprocessing_mode)
+                    else:
+                        # 기존 병렬 처리 방식
+                        results = process_frame_parallel(single_frame, qreader)
                     
                     # Binary 방법 제거로 파라미터별 결과 출력 로직 제거됨
                     
@@ -1036,17 +1051,38 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                             else:
                                 current_failed += 1
                             
-                            # 원본 방법명으로 통계 업데이트 (스케일 정보 제거)
-                            # "PyZbar-1-0.5x" → "PyZbar"
-                            if '-0.5x' in qr['method'] or '-0.75x' in qr['method'] or '-1.0x' in qr['method'] or '-1.25x' in qr['method'] or '-1.5x' in qr['method']:
+                            # 원본 방법명으로 통계 업데이트
+                            # "YOLO+QReader-1" → "YOLO+QReader"
+                            # "YOLO+밝기향상+QReader-1" → "YOLO+밝기향상+QReader"
+                            method_name = qr['method']
+                            
+                            # YOLO 방식인 경우 처리
+                            if method_name.startswith('YOLO+'):
+                                # 마지막 숫자 제거 (예: "YOLO+QReader-1" → "YOLO+QReader")
+                                if '-' in method_name and method_name[-1].isdigit():
+                                    # 마지막 하이픈과 숫자 제거
+                                    parts = method_name.rsplit('-', 1)
+                                    if parts[1].isdigit():
+                                        original_method = parts[0]
+                                    else:
+                                        original_method = method_name
+                                else:
+                                    original_method = method_name
+                            # 기존 방식 (스케일 정보 제거)
+                            elif '-0.5x' in method_name or '-0.75x' in method_name or '-1.0x' in method_name or '-1.25x' in method_name or '-1.5x' in method_name:
                                 # 스케일 정보와 인덱스 모두 제거
-                                temp_method = qr['method'].rsplit('-', 1)[0]  # 스케일 제거
+                                temp_method = method_name.rsplit('-', 1)[0]  # 스케일 제거
                                 if temp_method.endswith('-1'):
                                     original_method = temp_method[:-2]  # "-1" 제거
                                 else:
                                     original_method = temp_method.split('-')[0]  # 첫 번째 부분만
                             else:
-                                original_method = qr['method'].split('-')[0]  # 첫 번째 부분만
+                                # 일반적인 경우: 마지막 숫자 제거
+                                parts = method_name.rsplit('-', 1)
+                                if parts[1].isdigit():
+                                    original_method = parts[0]
+                                else:
+                                    original_method = method_name.split('-')[0]  # 첫 번째 부분만
                             
                             # method_stats에 존재하는 키인지 확인
                             if original_method in method_stats:
@@ -1259,142 +1295,6 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                 cv2.putText(display_frame, "PAUSED - Press SPACE to resume", (10, 60), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 테스트: 그리기 경로 확인용 화면 중앙 점(항상 표시)
-            try:
-                cv2.circle(display_frame, (display_width//2, display_height//2), 3, (0, 255, 255), -1)
-            except Exception:
-                pass
-
-            # 비동기 모드: 최신 결과 오버레이
-            if use_async_detection:
-                try:
-                    # 상태 텍스트
-                    qsize = frame_queue.qsize() if 'frame_queue' in locals() else 0
-                    hb_age = (time.time() - worker_heartbeat) if worker_heartbeat else -1
-                    # 빈 결과면 직전 성공 결과를 사용(깜빡임 완화)
-                    draw_qrs = latest_unique_qrs if (isinstance(latest_unique_qrs, list) and len(latest_unique_qrs) > 0) else last_success_qrs
-                    viz_n = len(draw_qrs) if isinstance(draw_qrs, list) else 0
-                    status_text = f"Async enq:{async_enq_count} det:{async_det_count} q:{qsize} hb:{hb_age:.1f}s viz:{viz_n}"
-                    cv2.putText(display_frame, status_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1)
-
-                    # 1초에 1회 샘플 구조 덤프(디버깅)
-                    if viz_n > 0:
-                        now_dbg = time.time()
-                        if now_dbg - last_debug_dump_time > 1.0:
-                            try:
-                                sample = latest_unique_qrs[0]
-                                det = sample.get('detection') if isinstance(sample, dict) else None
-                                if isinstance(det, dict):
-                                    det_keys = list(det.keys())
-                                    has_pts = det.get('points') is not None
-                                else:
-                                    det_keys = ['<not-dict>']
-                                    has_pts = False
-                                log_print(f"🧪 viz sample: success={sample.get('success')}, text_len={len(sample.get('text',''))}, det_keys={det_keys}, has_points={has_pts}")
-                            except Exception:
-                                pass
-                            last_debug_dump_time = now_dbg
-
-                    all_qr_visualizations = []
-                    for qr in (draw_qrs or []):
-                        if isinstance(qr, dict) and 'meta' in qr:
-                            continue
-                        detection = qr.get('detection')
-                        if detection is None:
-                            continue
-                        # 1) 좌표 우선순위: quad_xy -> polygon_xy -> bbox_xyxy -> points
-                        pts = None
-                        if isinstance(detection, dict):
-                            if 'quad_xy' in detection and detection['quad_xy'] is not None:
-                                pts = detection['quad_xy']
-                            elif 'polygon_xy' in detection and detection['polygon_xy'] is not None:
-                                poly = detection['polygon_xy']
-                                # 앞 4점만 사용
-                                try:
-                                    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)[:4]
-                                except Exception:
-                                    pts = None
-                            elif 'bbox_xyxy' in detection and detection['bbox_xyxy'] is not None:
-                                try:
-                                    x1, y1, x2, y2 = detection['bbox_xyxy']
-                                    pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-                                except Exception:
-                                    pts = None
-                            elif 'points' in detection and detection['points'] is not None:
-                                pts = detection['points']
-                        # 2) 최종 실패 시 bbox 유틸로 생성
-                        if pts is None:
-                            try:
-                                obbox, _ = get_qr_center_and_bbox(detection, image_width=width, image_height=height)
-                            except TypeError:
-                                obbox, _ = get_qr_center_and_bbox(detection)
-                            if obbox is not None:
-                                x1, y1, x2, y2 = map(float, obbox)
-                                pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-                        if pts is None:
-                            # 마지막 보루: bbox에서 중앙점만 찍어서 시각적 확인
-                            try:
-                                obbox3, _ = get_qr_center_and_bbox(detection, image_width=width, image_height=height)
-                            except TypeError:
-                                obbox3, _ = get_qr_center_and_bbox(detection)
-                            if obbox3 is not None:
-                                cx = (obbox3[0] + obbox3[2]) * 0.5
-                                cy = (obbox3[1] + obbox3[3]) * 0.5
-                                sx = display_width / max(1, width)
-                                sy = display_height / max(1, height)
-                                cv2.circle(display_frame, (int(cx*sx), int(cy*sy)), 6, (0,255,255), -1)
-                            continue
-                        # 성공 결과면 ROI 갱신(원본 좌표 기준 obbox 재계산)
-                        try:
-                            if qr.get('success'):
-                                obbox2, _ = get_qr_center_and_bbox(detection, image_width=width, image_height=height)
-                                if obbox2 is not None:
-                                    ox1, oy1, ox2, oy2 = map(int, obbox2)
-                                    roi_bbox = (ox1, oy1, ox2, oy2)
-                        except Exception:
-                            pass
-                        # 정규화: (N,2) 배열로 변환 후 화면 스케일 적용
-                        try:
-                            pts_arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
-                            sx = display_width / max(1, width)
-                            sy = display_height / max(1, height)
-                            pts_arr[:, 0] = np.clip(pts_arr[:, 0] * sx, 0, display_width - 1)
-                            pts_arr[:, 1] = np.clip(pts_arr[:, 1] * sy, 0, display_height - 1)
-                            if pts_arr.shape[0] >= 4:
-                                poly = pts_arr[:4].astype(np.int32).reshape(1, -1, 2)
-                            else:
-                                poly = None
-                        except Exception:
-                            poly = None
-                        color = (0,255,0) if qr.get('success') else (0,0,255)
-                        # 폴리곤 우선 그리기
-                        if poly is not None:
-                            cv2.polylines(display_frame, [poly], True, color, 2)
-                        # 중심점은 항상 표시(가시성 보장) + 텍스트도 중심 근처에 표시
-                        try:
-                            obbox_c, _ = get_qr_center_and_bbox(detection, image_width=width, image_height=height)
-                        except TypeError:
-                            obbox_c, _ = get_qr_center_and_bbox(detection)
-                        if obbox_c is not None:
-                            cx = (obbox_c[0] + obbox_c[2]) * 0.5
-                            cy = (obbox_c[1] + obbox_c[3]) * 0.5
-                            cx_i = int(np.clip(cx * (display_width / max(1, width)), 0, display_width - 1))
-                            cy_i = int(np.clip(cy * (display_height / max(1, height)), 0, display_height - 1))
-                            cv2.circle(display_frame, (cx_i, cy_i), 5, (0, 255, 255), -1)
-                            txt_center = qr.get('text','')
-                            if txt_center:
-                                cv2.putText(display_frame, txt_center[:30], (max(0, cx_i-20), max(10, cy_i-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
-                        # 텍스트 표시
-                        txt = qr.get('text','')
-                        if txt and poly is not None:
-                            tx = int(poly[0,0,0]); ty = max(0, int(poly[0,0,1]-6))
-                            cv2.putText(display_frame, txt[:30], (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                except Exception as e:
-                    now = time.time()
-                    if now - last_overlay_error_time > 0.8:
-                        log_print(f"    ❌ 비동기 오버레이 오류: {e}")
-                        last_overlay_error_time = now
-
             # 화면에 표시
             cv2.imshow("Video Player + QR Detection", display_frame)
             
@@ -1415,73 +1315,67 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                 save_path = os.path.join(output_run_dir, f"screenshot_{frame_count:06d}.jpg")
                 cv2.imwrite(save_path, display_frame)
                 print(f"📷 스크린샷 저장: {save_path}")
-
-            # 비동기 모드일 때 최신 프레임 큐에 공급 (가장 최신만 유지)
-            if use_async_detection:
-                try:
-                    if frame_queue.full():
-                        _ = frame_queue.get_nowait()
-                    frame_queue.put_nowait(frame)
-                    async_enq_count += 1
-                except Exception:
-                    pass
     
     except KeyboardInterrupt:
         print("\n⏹️ Ctrl+C로 종료되었습니다.")
     
-    # 정리 전: 탐지 마무리 표시(짧은 플러시)
-    try:
-        flush_deadline = time.time() + 0.8  # 최대 0.8초 플러시
-        while use_async_detection and time.time() < flush_deadline:
-            if 'display_frame' in locals() and latest_unique_qrs:
-                frame_copy = display_frame.copy()
-                try:
-                    for qr in latest_unique_qrs:
-                        if isinstance(qr, dict) and 'meta' in qr:
-                            continue
-                        detection = qr.get('detection')
-                        if not isinstance(detection, dict):
-                            continue
-                        pts = detection.get('points')
-                        if pts is None:
-                            bbox, _ = get_qr_center_and_bbox(detection, image_width=frame_copy.shape[1], image_height=frame_copy.shape[0])
-                            if bbox is not None:
-                                x1, y1, x2, y2 = map(int, bbox)
-                                pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-                        if pts is None:
-                            continue
-                        color = (0,255,0) if qr.get('success') else (0,0,255)
-                        for i in range(4):
-                            p1 = pts[i]
-                            p2 = pts[(i+1)%4]
-                            cv2.line(frame_copy, p1, p2, color, 2)
-                    cv2.imshow("Video Player + QR Detection", frame_copy)
-                    if cv2.waitKey(1) & 0xFF == 27:
-                        break
-                except Exception:
-                    break
-            else:
-                break
-    except Exception:
-        pass
-
     # 정리
-    async_running = False
-    try:
-        detect_thread.join(timeout=0.5)
-    except Exception:
-        pass
     cap.release()
     cv2.destroyAllWindows()
-    log_file.close()
-    log_print(f"\n📝 로그 파일 저장 완료: {log_file_path}")
     
-    # 결과 요약
-    elapsed = time.time() - start_time
-    # 🕐 전체 실행 시간 계산
+    # 총 실행 시간 계산 (로그 파일 닫기 전에)
     total_end_time = time.time()
     total_execution_time = total_end_time - total_start_time
     
+    # 결과 요약 계산
+    elapsed = time.time() - start_time
+    # 🕐 전체 실행 시간은 이미 위에서 계산됨
+    
+    # 로그 파일에 결과 통계 기록 (로그 파일 닫기 전에)
+    log_print(f"\n📊 결과 통계!")
+    log_print(f"  총 프레임: {total_frames}")
+    log_print(f"  재생 시간: {elapsed:.1f}초")
+    log_print(f"  🚀 총 실행 시간: {total_execution_time:.1f}초 (병렬 처리)")
+    log_print(f"  탐지된 QR 코드: {detected_count}개")
+    log_print(f"  고유 QR 코드: {detected_count}개 (중복 제거 후)")
+    log_print(f"  탐지율: {detected_count/frame_count*100:.1f}%" if frame_count > 0 else "  탐지율: 0.0%")
+    log_print(f"  ✅ 성공: {success_count}개")
+    log_print(f"  ❌ 실패: {failed_count}개")
+    log_print(f"  결과 저장: {output_run_dir}/")
+    
+    log_print(f"\n🎯 방법별 성공률:")
+    total_method_success = sum(method_stats.values())
+    for method, count in method_stats.items():
+        if total_method_success > 0:
+            percentage = (count / total_method_success) * 100
+            log_print(f"  {method}: {count}개 ({percentage:.1f}%)")
+    
+    log_print(f"\n📊 테스트용 상세 통계:")
+    log_print(f"  방법별 탐지 개수:")
+    for method, count in method_detection_count.items():
+        log_print(f"    {method}: {count}개")
+    
+    log_print(f"  방법별 성공률 (탐지 대비):")
+    for method in method_stats.keys():
+        detected = method_detection_count[method]
+        success = method_stats[method]
+        if detected > 0:
+            success_rate = (success / detected) * 100
+            log_print(f"    {method}: {success}/{detected} ({success_rate:.1f}%)")
+        else:
+            log_print(f"    {method}: 0/0 (0.0%)")
+    
+    # 로그 파일에 총 실행 시간 기록
+    log_print(f"\n" + "=" * 60)
+    log_print(f"⏱️  총 실행 시간: {total_execution_time:.2f}초 ({total_execution_time/60:.2f}분)")
+    if frame_count > 0:
+        avg_time_per_frame = total_execution_time / frame_count
+        log_print(f"   평균 프레임 처리 시간: {avg_time_per_frame*1000:.2f}ms/프레임")
+    log_print(f"=" * 60)
+    log_print(f"\n📝 로그 파일 저장 완료: {log_file_path}")
+    log_file.close()
+    
+    # 콘솔에도 결과 출력
     print(f"\n📊 결과 통계!")
     print(f"  총 프레임: {total_frames}")
     print(f"  재생 시간: {elapsed:.1f}초")
@@ -1514,6 +1408,14 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
             print(f"    {method}: {success}/{detected} ({success_rate:.1f}%)")
         else:
             print(f"    {method}: 0/0 (0.0%)")
+    
+    # 총 실행 시간 (마지막에 강조 표시)
+    print(f"\n" + "=" * 60)
+    print(f"⏱️  총 실행 시간: {total_execution_time:.2f}초 ({total_execution_time/60:.2f}분)")
+    if frame_count > 0:
+        avg_time_per_frame = total_execution_time / frame_count
+        print(f"   평균 프레임 처리 시간: {avg_time_per_frame*1000:.2f}ms/프레임")
+    print(f"=" * 60)
 
 if __name__ == "__main__":
     import sys
