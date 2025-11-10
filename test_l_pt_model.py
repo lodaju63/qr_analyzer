@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 import time
 import datetime
+import threading
+from queue import Queue, Empty
 
 # Ultralytics YOLO 모델 로드 시도
 try:
@@ -172,8 +174,23 @@ def visualize_results(image, detections, save_path=None):
     plt.show()
 
 def test_video_detection(model, video_path, conf_threshold=0.25, 
-                        frame_interval=30, show_video=True, save_output=True):
-    """YOLO 모델로 영상 탐지 테스트"""
+                        frame_interval=1, show_video=True, save_output=True,
+                        process_scale=1.0):
+    """YOLO 모델로 영상 탐지 테스트
+    
+    Args:
+        model: YOLO 모델
+        video_path: 비디오 파일 경로
+        conf_threshold: 신뢰도 임계값
+        frame_interval: 탐지 간격 (1=모든 프레임, 5=5프레임마다, 30=30프레임마다)
+        show_video: 화면 표시 여부
+        save_output: 결과 영상 저장 여부
+        process_scale: 처리 해상도 스케일 (1.0=원본, 0.5=50%, 0.25=25%)
+    
+    Note:
+        - 원본 해상도로 탐지 (프레임 리사이징 없음)
+        - frame_interval=1로 설정하면 모든 프레임에서 탐지 (실시간처럼)
+    """
     print(f"\n🎬 영상 테스트: {os.path.basename(video_path)}")
     print("=" * 60)
     
@@ -195,8 +212,15 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = total_frames / fps if fps > 0 else 0
     
+    # 처리 해상도 설정
+    process_width = int(width * process_scale)
+    process_height = int(height * process_scale)
+    scale_x = width / process_width if process_width > 0 else 1.0
+    scale_y = height / process_height if process_height > 0 else 1.0
+    
     print(f"📹 영상 정보:")
-    print(f"   해상도: {width}x{height}")
+    print(f"   원본 해상도: {width}x{height}")
+    print(f"   처리 해상도: {process_width}x{process_height} (스케일: {process_scale*100:.0f}%)")
     print(f"   FPS: {fps:.2f}")
     print(f"   총 프레임: {total_frames}")
     print(f"   길이: {duration:.2f}초")
@@ -221,6 +245,7 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
     total_detections = 0
     detection_times = []
     detections_per_frame = []
+    frame_processing_times = []  # 각 프레임 처리 시간 (탐지 + 시각화 등)
     
     # 마지막 탐지 결과 저장 (다음 탐지 전까지 표시)
     last_detections = []
@@ -235,10 +260,82 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
         log_file.flush()
     
     log_print(f"영상 테스트 시작: {video_path}")
-    log_print(f"설정: conf_threshold={conf_threshold}, frame_interval={frame_interval}")
+    log_print(f"설정: conf_threshold={conf_threshold}, frame_interval={frame_interval}, process_scale={process_scale}")
+    log_print(f"해상도: 원본 {width}x{height} → 처리 {process_width}x{process_height}")
     log_print("-" * 60)
     
-    print(f"\n▶️  영상 처리 시작...")
+    # 비동기/백그라운드 처리 설정
+    frame_queue = Queue(maxsize=10)  # 프레임 큐 (최대 10개)
+    result_queue = Queue()  # 결과 큐
+    stop_worker = threading.Event()  # 워커 스레드 종료 플래그
+    
+    def detection_worker():
+        """백그라운드에서 탐지 수행하는 워커 스레드"""
+        while not stop_worker.is_set():
+            try:
+                # 프레임 큐에서 프레임 가져오기 (타임아웃 설정)
+                item = frame_queue.get(timeout=0.1)
+                if item is None:  # 종료 신호
+                    break
+                
+                frame_num, process_frame_copy, frame_time = item
+                
+                # 프레임 간격에 따라 탐지
+                should_detect = (frame_num % frame_interval == 0) or (frame_num == 1)
+                
+                if not should_detect:
+                    frame_queue.task_done()
+                    continue
+                
+                # 탐지 수행
+                detect_start = time.time()
+                results = model(process_frame_copy, conf=conf_threshold, verbose=False)
+                detect_time = time.time() - detect_start
+                
+                result = results[0]
+                detections = []
+                
+                if result.boxes is not None and len(result.boxes) > 0:
+                    for box in result.boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        
+                        # 원본 해상도 좌표로 변환
+                        if process_scale < 1.0:
+                            xyxy = [
+                                xyxy[0] * scale_x,
+                                xyxy[1] * scale_y,
+                                xyxy[2] * scale_x,
+                                xyxy[3] * scale_y
+                            ]
+                        
+                        class_name = result.names[cls] if hasattr(result, 'names') else f"Class_{cls}"
+                        
+                        detections.append({
+                            'class': class_name,
+                            'confidence': conf,
+                            'bbox': xyxy,
+                            'class_id': cls
+                        })
+                
+                # 결과를 큐에 저장
+                result_queue.put((frame_num, detections, detect_time))
+                frame_queue.task_done()
+                
+            except Empty:
+                continue
+            except Exception as e:
+                log_print(f"워커 스레드 오류: {e}")
+                if item:
+                    frame_queue.task_done()
+    
+    # 워커 스레드 시작
+    worker_thread = threading.Thread(target=detection_worker, daemon=True)
+    worker_thread.start()
+    log_print("✅ 백그라운드 탐지 워커 스레드 시작")
+    
+    print(f"\n▶️  영상 처리 시작... (비동기 백그라운드 처리 모드)")
     start_time = time.time()
     
     try:
@@ -250,55 +347,61 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
             frame_count += 1
             current_time = frame_count / fps if fps > 0 else 0
             
-            # 프레임 간격에 따라 탐지
-            should_detect = (frame_count % frame_interval == 0) or (frame_count == 1)
+            # 프레임 처리 시작 시간
+            frame_start_time = time.time()
             
-            detections = []
-            if should_detect:
-                # 탐지 수행
-                detect_start = time.time()
-                results = model(frame, conf=conf_threshold, verbose=False)
-                detect_time = time.time() - detect_start
-                detection_times.append(detect_time)
-                
-                result = results[0]
-                
-                if result.boxes is not None and len(result.boxes) > 0:
-                    frame_detections = 0
-                    for box in result.boxes:
-                        cls = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        xyxy = box.xyxy[0].cpu().numpy()
-                        
-                        class_name = result.names[cls] if hasattr(result, 'names') else f"Class_{cls}"
-                        
-                        detections.append({
-                            'class': class_name,
-                            'confidence': conf,
-                            'bbox': xyxy,
-                            'class_id': cls
-                        })
-                        
-                        frame_detections += 1
-                        total_detections += 1
-                    
-                    detection_count += 1
-                    detections_per_frame.append(frame_detections)
-                    
-                    # 마지막 탐지 결과 업데이트
-                    last_detections = detections.copy()
-                    
-                    log_print(f"프레임 {frame_count} ({current_time:.2f}초): {frame_detections}개 탐지")
-                    for i, det in enumerate(detections):
-                        log_print(f"  [{i+1}] {det['class']}: {det['confidence']:.2%} "
-                                 f"at [{int(det['bbox'][0])}, {int(det['bbox'][1])}, "
-                                 f"{int(det['bbox'][2])}, {int(det['bbox'][3])}]")
+            # 처리용 해상도로 축소 (백그라운드 처리를 위해)
+            if process_scale < 1.0:
+                process_frame = cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_LINEAR)
+            else:
+                process_frame = frame
             
-            # 결과 시각화 (마지막 탐지 결과 사용)
+            # 프레임을 백그라운드 큐에 추가 (논블로킹)
+            try:
+                frame_queue.put_nowait((frame_count, process_frame.copy(), current_time))
+            except:
+                # 큐가 가득 차면 가장 오래된 항목 제거
+                try:
+                    frame_queue.get_nowait()
+                    frame_queue.task_done()
+                    frame_queue.put_nowait((frame_count, process_frame.copy(), current_time))
+                except:
+                    pass
+            
+            # 결과 큐에서 새로운 탐지 결과 확인 (논블로킹)
+            new_detections = None
+            while True:
+                try:
+                    result_frame_num, result_detections, detect_time = result_queue.get_nowait()
+                    
+                    # 통계 업데이트
+                    if result_detections:
+                        detection_times.append(detect_time)
+                        frame_detections_count = len(result_detections)
+                        detections_per_frame.append(frame_detections_count)
+                        detection_count += 1
+                        total_detections += len(result_detections)
+                        
+                        # 로그 출력
+                        log_print(f"프레임 {result_frame_num} ({result_frame_num / fps if fps > 0 else 0:.2f}초): {frame_detections_count}개 탐지")
+                        for i, det in enumerate(result_detections):
+                            log_print(f"  [{i+1}] {det['class']}: {det['confidence']:.2%} "
+                                     f"at [{int(det['bbox'][0])}, {int(det['bbox'][1])}, "
+                                     f"{int(det['bbox'][2])}, {int(det['bbox'][3])}]")
+                    
+                    # 가장 최근 결과로 업데이트
+                    if result_frame_num == frame_count or result_frame_num > len(last_detections) or not last_detections:
+                        last_detections = result_detections.copy() if result_detections else []
+                        new_detections = result_detections
+                    
+                except Empty:
+                    break
+            
+            # 결과 시각화 (최신 탐지 결과 사용)
             vis_frame = frame.copy()
             
             # 바운딩 박스 그리기
-            display_detections = last_detections if not should_detect or len(detections) == 0 else detections
+            display_detections = last_detections
             for det in display_detections:
                 x1, y1, x2, y2 = map(int, det['bbox'])
                 
@@ -317,8 +420,8 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
             info_text = f"Frame: {frame_count}/{total_frames} | Time: {current_time:.1f}s"
             if display_detections:
                 info_text += f" | Detections: {len(display_detections)}"
-            if not should_detect and display_detections:
-                info_text += " (cached)"
+            if new_detections is None:
+                info_text += " (async)"
             cv2.putText(vis_frame, info_text, (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
@@ -326,7 +429,7 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
             if out_video is not None:
                 out_video.write(vis_frame)
             
-            # 화면에 표시
+            # 화면에 표시 (모든 프레임 즉시 표시)
             if show_video:
                 # 화면 크기에 맞게 리사이즈
                 display_width = 1280
@@ -337,21 +440,36 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
                 else:
                     display_frame = vis_frame
                 
-                cv2.imshow('QR Detection Test', display_frame)
+                cv2.imshow('QR Detection Test (Async)', display_frame)
                 
                 # 'q' 키를 누르면 종료
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     print("\n⚠️ 사용자가 중단했습니다.")
                     break
             
-            # 진행 상황 출력
-            if frame_count % (frame_interval * 10) == 0:
+            # 프레임 처리 시간 측정 (표시만, 실제 탐지는 백그라운드)
+            frame_processing_time = time.time() - frame_start_time
+            frame_processing_times.append(frame_processing_time)
+            
+            # 진행 상황 출력 (실시간 처리 속도 포함)
+            if frame_count % 30 == 0:
                 progress = (frame_count / total_frames) * 100
-                print(f"   진행: {progress:.1f}% ({frame_count}/{total_frames} 프레임)")
+                # 현재까지의 평균 처리 FPS 계산
+                elapsed_time = time.time() - start_time
+                current_processing_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+                speed_ratio = (current_processing_fps / fps * 100) if fps > 0 else 0
+                print(f"   진행: {progress:.1f}% ({frame_count}/{total_frames} 프레임) | "
+                      f"처리 속도: {current_processing_fps:.2f} FPS (원본 {fps:.2f} FPS의 {speed_ratio:.1f}%)")
     
     except KeyboardInterrupt:
         print("\n⚠️ 사용자가 중단했습니다.")
     finally:
+        # 워커 스레드 종료
+        stop_worker.set()
+        frame_queue.put(None)  # 종료 신호
+        worker_thread.join(timeout=2.0)
+        log_print("✅ 백그라운드 탐지 워커 스레드 종료")
+        
         # 정리
         total_time = time.time() - start_time
         cap.release()
@@ -366,8 +484,35 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
         print(f"   탐지된 프레임: {detection_count}")
         print(f"   총 탐지 수: {total_detections}")
         print(f"   처리 시간: {total_time:.2f}초")
+        
+        # 처리 속도 통계
+        if frame_count > 0 and total_time > 0:
+            actual_fps = frame_count / total_time
+            print(f"\n⚡ 처리 속도 분석:")
+            print(f"   원본 영상 FPS: {fps:.2f}")
+            print(f"   실제 처리 FPS: {actual_fps:.2f}")
+            speed_ratio = (actual_fps / fps * 100) if fps > 0 else 0
+            print(f"   속도 비율: {speed_ratio:.1f}% (원본 대비)")
+            if actual_fps >= fps:
+                print(f"   ✅ 실시간 처리 가능! (원본보다 {actual_fps/fps:.2f}x 빠름)")
+            else:
+                print(f"   ⚠️ 실시간 처리 불가 (원본의 {actual_fps/fps:.2f}x 느림)")
+        
+        if frame_processing_times:
+            avg_frame_time = np.mean(frame_processing_times)
+            min_frame_time = np.min(frame_processing_times)
+            max_frame_time = np.max(frame_processing_times)
+            print(f"\n📈 프레임 처리 시간:")
+            print(f"   평균: {avg_frame_time*1000:.2f}ms")
+            print(f"   최소: {min_frame_time*1000:.2f}ms")
+            print(f"   최대: {max_frame_time*1000:.2f}ms")
+            if fps > 0:
+                target_frame_time = 1.0 / fps
+                print(f"   목표 (원본 FPS 기준): {target_frame_time*1000:.2f}ms")
+        
         if detection_times:
             avg_detect_time = np.mean(detection_times)
+            print(f"\n🔍 탐지 시간:")
             print(f"   평균 탐지 시간: {avg_detect_time*1000:.2f}ms")
         if detections_per_frame:
             avg_detections = np.mean(detections_per_frame)
@@ -377,6 +522,32 @@ def test_video_detection(model, video_path, conf_threshold=0.25,
         log_print(f"처리 완료")
         log_print(f"총 프레임: {frame_count}, 탐지 프레임: {detection_count}, 총 탐지: {total_detections}")
         log_print(f"처리 시간: {total_time:.2f}초")
+        
+        # 처리 속도 로그
+        if frame_count > 0 and total_time > 0:
+            actual_fps = frame_count / total_time
+            log_print(f"\n⚡ 처리 속도 분석:")
+            log_print(f"   원본 영상 FPS: {fps:.2f}")
+            log_print(f"   실제 처리 FPS: {actual_fps:.2f}")
+            speed_ratio = (actual_fps / fps * 100) if fps > 0 else 0
+            log_print(f"   속도 비율: {speed_ratio:.1f}% (원본 대비)")
+            if actual_fps >= fps:
+                log_print(f"   ✅ 실시간 처리 가능! (원본보다 {actual_fps/fps:.2f}x 빠름)")
+            else:
+                log_print(f"   ⚠️ 실시간 처리 불가 (원본의 {actual_fps/fps:.2f}x 느림)")
+        
+        if frame_processing_times:
+            avg_frame_time = np.mean(frame_processing_times)
+            min_frame_time = np.min(frame_processing_times)
+            max_frame_time = np.max(frame_processing_times)
+            log_print(f"\n📈 프레임 처리 시간:")
+            log_print(f"   평균: {avg_frame_time*1000:.2f}ms")
+            log_print(f"   최소: {min_frame_time*1000:.2f}ms")
+            log_print(f"   최대: {max_frame_time*1000:.2f}ms")
+            if fps > 0:
+                target_frame_time = 1.0 / fps
+                log_print(f"   목표 (원본 FPS 기준): {target_frame_time*1000:.2f}ms")
+        
         log_file.close()
         
         if video_output_path:
@@ -415,7 +586,8 @@ def main():
             
             # 사용자 설정
             conf_threshold = 0.25  # 신뢰도 임계값
-            frame_interval = 30    # N프레임마다 탐지 (성능 향상을 위해)
+            frame_interval = 2     # 2프레임마다 탐지 (속도 향상)
+            process_scale = 1.0    # 처리 해상도 스케일 (1.0=원본, 0.5=50%, 0.25=25%)
             show_video = True      # 화면에 표시 여부
             save_output = True     # 결과 영상 저장 여부
             
@@ -425,7 +597,8 @@ def main():
                 conf_threshold=conf_threshold,
                 frame_interval=frame_interval,
                 show_video=show_video,
-                save_output=save_output
+                save_output=save_output,
+                process_scale=process_scale
             )
             
             if result:

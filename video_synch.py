@@ -1,6 +1,6 @@
 """
-영상 플레이어 + 실시간 QR 탐지
-영상을 화면에 보여주면서 QR 코드 탐지 시 시각화
+영상 플레이어 + 실시간 QR 탐지 (병렬 처리)
+[최종 최적화]: YOLO ROI 리스트를 먼저 필터링하여 중복 스레드 생성을 방지
 """
 
 import cv2
@@ -55,7 +55,7 @@ except ImportError:
 
 # 병렬 처리용 QR 탐지 함수들
 def qreader_detect_parallel(frame, qreader, results_queue):
-    """QReader 탐지 (병렬 처리용)"""
+    """QReader 탐지 (병렬 처리용) - [비-YOLO 모드용]"""
     try:
         detections = qreader.detect(frame)
         if detections and len(detections) > 0:
@@ -123,7 +123,7 @@ def _process_decoded_text(decoded_text):
     return decoded_text
 
 def brightness_qreader_detect_parallel(frame, qreader, results_queue):
-    """밝기향상+QReader 탐지 (병렬 처리용, 파라미터 스윕)"""
+    """밝기향상+QReader 탐지 (병렬 처리용, 파라미터 스윕) - [비-YOLO 모드용]"""
     try:
         # 성능 최적 조합: 밝기향상 파라미터 (속도·성공률 균형)
         params = [
@@ -158,7 +158,7 @@ def brightness_qreader_detect_parallel(frame, qreader, results_queue):
         pass
 
 def clahe_qreader_detect_parallel(frame, qreader, results_queue):
-    """CLAHE+QReader 탐지 (병렬 처리용, 파라미터 스윕)"""
+    """CLAHE+QReader 탐지 (병렬 처리용, 파라미터 스윕) - [비-YOLO 모드용]"""
     try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         # 성능 최적 조합: CLAHE 파라미터 (tile=(3,3) 고정)
@@ -193,6 +193,7 @@ def clahe_qreader_detect_parallel(frame, qreader, results_queue):
 
 # 반전+QReader (흰색 QR용)
 def inverted_qreader_detect_parallel(frame, qreader, results_queue):
+    """[비-YOLO 모드용]"""
     try:
         inverted = cv2.bitwise_not(frame)
         detections = qreader.detect(inverted)
@@ -235,6 +236,7 @@ def inverted_qreader_detect_parallel(frame, qreader, results_queue):
 
 # 반전+CLAHE+QReader
 def inverted_clahe_qreader_detect_parallel(frame, qreader, results_queue):
+    """[비-YOLO 모드용]"""
     try:
         inverted = cv2.bitwise_not(frame)
         gray = cv2.cvtColor(inverted, cv2.COLOR_BGR2GRAY)
@@ -313,20 +315,27 @@ def yolo_detect_qr_locations(model, frame, conf_threshold=0.25):
     except Exception as e:
         return []
 
+# -----------------------------------------------------------------
+# ★★★★★ 원본 복원 ★★★★★
+#
+# `qreader.detect(roi)`를 다시 호출하여 정확한 시각화 좌표(`quad_xy`)를
+# 확보하고 해독 성공률을 높이는 원본 로직으로 복원합니다.
+# -----------------------------------------------------------------
 def decode_roi_parallel(roi, qreader, bbox, results_queue, method_name="YOLO+QReader"):
-    """ROI 영역에서 QR 코드 해독 (병렬 처리용)"""
+    """ROI 영역에서 QR 코드 해독 (병렬 처리용) - [원본 버전]"""
     try:
-        # ROI에서 detect 먼저 실행 (더 정확한 위치 찾기)
+        # 1단계: detect()로 위치 찾기 (더 정확한 위치, quad_xy 확보)
         detections = qreader.detect(roi)
         
         if detections and len(detections) > 0:
             # 첫 번째 detection 사용
             detection = detections[0]
+            # 2단계: 찾은 힌트(detection)로 decode() 실행
             decoded_text = qreader.decode(roi, detection)
         else:
             # detect 실패 시 ROI 전체에서 직접 decode 시도
             decoded_text = qreader.decode(roi)
-            detection = None
+            detection = None # 힌트 없음
         
         if decoded_text:
             decoded_text = _process_decoded_text(decoded_text)
@@ -336,7 +345,6 @@ def decode_roi_parallel(roi, qreader, bbox, results_queue, method_name="YOLO+QRe
                 
                 if detection and 'quad_xy' in detection:
                     # ROI 내 좌표를 원본 이미지 좌표로 변환
-                    roi_h, roi_w = roi.shape[:2]
                     quad_xy = []
                     for qx, qy in detection['quad_xy']:
                         # ROI 내 상대 좌표를 원본 이미지 절대 좌표로 변환
@@ -345,11 +353,11 @@ def decode_roi_parallel(roi, qreader, bbox, results_queue, method_name="YOLO+QRe
                         quad_xy.append([abs_x, abs_y])
                     
                     detection_result = {
-                        'bbox_xyxy': [x1, y1, x2, y2],
-                        'quad_xy': quad_xy
+                        'bbox_xyxy': [x1, y1, x2, y2], # YOLO의 넓은 bbox
+                        'quad_xy': quad_xy # QReader의 정밀한 quad
                     }
                 else:
-                    # detection 정보가 없으면 bbox 기반으로 생성
+                    # detection 정보가 없으면 YOLO의 bbox 기반으로 생성
                     detection_result = {
                         'bbox_xyxy': [x1, y1, x2, y2],
                         'quad_xy': [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
@@ -370,10 +378,84 @@ def decode_roi_with_preprocessing_parallel(roi, qreader, bbox, results_queue, me
     try:
         processed_roi = preprocessing_func(roi)
         if processed_roi is not None:
+            # 원본 decode_roi_parallel (정확도 우선)을 호출합니다.
             decode_roi_parallel(processed_roi, qreader, bbox, results_queue, method_name)
     except Exception:
         pass
 
+# -----------------------------------------------------------------
+# ★★★★★ IoU 계산 함수들을 위로 이동 ★★★★★
+# `process_frame_with_yolo` 보다 먼저 정의되어야 합니다.
+# -----------------------------------------------------------------
+def calculate_iou(bbox1, bbox2):
+    """두 바운딩 박스의 IoU(Intersection over Union) 계산"""
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+    
+    # 교집합 영역 계산
+    x1_i = max(x1_1, x1_2)
+    y1_i = max(y1_1, y1_2)
+    x2_i = min(x2_1, x2_2)
+    y2_i = min(y2_1, y2_2)
+    
+    # 교집합이 없는 경우
+    if x2_i <= x1_i or y2_i <= y1_i:
+        return 0.0
+    
+    intersection = (x2_i - x1_i) * (y2_i - y1_i)
+    
+    # 각 박스의 면적
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    
+    # 합집합 영역
+    union = area1 + area2 - intersection
+    
+    # IoU 계산
+    iou = intersection / union if union > 0 else 0.0
+    return iou
+
+# -----------------------------------------------------------------
+# ★★★★★ 새로운 최적화 함수 ★★★★★
+#
+# YOLO ROI 리스트를 필터링하는 함수
+# -----------------------------------------------------------------
+def filter_overlapping_yolo_rois(locations, iou_threshold=0.5):
+    """
+    YOLO가 반환한 ROI 리스트에서 겹치는 ROI를 제거 (NMS와 유사)
+    qreader 스레드를 생성하기 전에 호출하여 중복 스레드 생성을 방지합니다.
+    """
+    if not locations:
+        return []
+    
+    # 신뢰도(confidence) 기준으로 정렬 (높은 것이 우선)
+    locations.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    filtered_locations = []
+    for location in locations:
+        is_overlapping = False
+        bbox1 = location['bbox']
+        
+        for filtered in filtered_locations:
+            bbox2 = filtered['bbox']
+            # calculate_iou는 (x1, y1, x2, y2) 포맷을 사용
+            iou = calculate_iou(bbox1, bbox2)
+            
+            if iou > iou_threshold:
+                is_overlapping = True
+                break
+        
+        if not is_overlapping:
+            filtered_locations.append(location)
+            
+    return filtered_locations
+
+# -----------------------------------------------------------------
+# ★★★★★ 핵심 수정 사항 ★★★★★
+#
+# `process_frame_with_yolo`가 `filter_overlapping_yolo_rois`를
+# 호출하도록 수정합니다.
+# -----------------------------------------------------------------
 def process_frame_with_yolo(frame, yolo_model, qreader, conf_threshold=0.25, use_preprocessing=False):
     """YOLO로 빠르게 위치 찾고, ROI에서만 해독하는 최적화된 처리
     
@@ -391,16 +473,24 @@ def process_frame_with_yolo(frame, yolo_model, qreader, conf_threshold=0.25, use
     if yolo_model is not None:
         qr_locations = yolo_detect_qr_locations(yolo_model, frame, conf_threshold)
         
-        if qr_locations:
+        # ★★★★★ 새로운 최적화 단계 ★★★★★
+        # qreader 스레드를 생성하기 *전에* 겹치는 ROI를 먼저 제거
+        filtered_locations = filter_overlapping_yolo_rois(qr_locations, iou_threshold=0.5)
+        
+        # (디버깅용)
+        if len(qr_locations) > len(filtered_locations):
+            print(f"    ⚡ ROI 필터링: {len(qr_locations)}개 -> {len(filtered_locations)}개 (중복 스레드 방지)")
+        
+        if filtered_locations: # ★ 수정: filtered_locations 사용
             # 2단계: 각 ROI에서 병렬로 해독 시도
-            for i, location in enumerate(qr_locations):
+            for i, location in enumerate(filtered_locations): # ★ 수정: filtered_locations 사용
                 x1, y1, x2, y2 = location['bbox']
                 roi = frame[y1:y2, x1:x2]
                 
                 if roi.size == 0:
                     continue
                 
-                # 원본 ROI 해독 (항상 실행)
+                # 원본 ROI 해독 (항상 실행) - ★ 원본 함수(정확도 우선) 호출
                 if qreader:
                     threads.append(threading.Thread(
                         target=decode_roi_parallel,
@@ -408,7 +498,6 @@ def process_frame_with_yolo(frame, yolo_model, qreader, conf_threshold=0.25, use
                     ))
                     
                     # 전처리된 ROI 해독 (옵션, 원본 실패 시에만 유용)
-                    # 성능 최적화: 전처리 방법 제거 (원본이 이미 100% 성공률)
                     if use_preprocessing:
                         threads.append(threading.Thread(
                             target=decode_roi_with_preprocessing_parallel,
@@ -444,7 +533,7 @@ def process_frame_with_yolo(frame, yolo_model, qreader, conf_threshold=0.25, use
     return process_frame_parallel(frame, qreader)
 
 def process_frame_parallel(frame, qreader):
-    """프레임을 병렬로 처리하여 모든 QR 탐지 방법 실행 (기존 방식)"""
+    """프레임을 병렬로 처리하여 모든 QR 탐지 방법 실행 (기존 방식 - 비-YOLO 모드용)"""
     results_queue = queue.Queue()
     threads = []
     
@@ -546,33 +635,6 @@ def is_center_in_bbox(center_x, center_y, bbox_x1, bbox_y1, bbox_x2, bbox_y2):
     """중심점이 사각형 안에 있는지 확인"""
     return bbox_x1 <= center_x <= bbox_x2 and bbox_y1 <= center_y <= bbox_y2
 
-def calculate_iou(bbox1, bbox2):
-    """두 바운딩 박스의 IoU(Intersection over Union) 계산"""
-    x1_1, y1_1, x2_1, y2_1 = bbox1
-    x1_2, y1_2, x2_2, y2_2 = bbox2
-    
-    # 교집합 영역 계산
-    x1_i = max(x1_1, x1_2)
-    y1_i = max(y1_1, y1_2)
-    x2_i = min(x2_1, x2_2)
-    y2_i = min(y2_1, y2_2)
-    
-    # 교집합이 없는 경우
-    if x2_i <= x1_i or y2_i <= y1_i:
-        return 0.0
-    
-    intersection = (x2_i - x1_i) * (y2_i - y1_i)
-    
-    # 각 박스의 면적
-    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    
-    # 합집합 영역
-    union = area1 + area2 - intersection
-    
-    # IoU 계산
-    iou = intersection / union if union > 0 else 0.0
-    return iou
 
 def calculate_center_distance(bbox1, bbox2):
     """두 바운딩 박스의 중심점 간 거리 계산"""
@@ -920,7 +982,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
     fps_start_time = time.time()
     
     # 탐지 간격 설정 (성능 향상)
-    detection_interval = 5  # 5프레임마다 탐지
+    detection_interval = 2  # 5프레임마다 탐지
     last_detection_frame = 0
     
     # 통계 변수
@@ -1011,12 +1073,12 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                     # YOLO 모드 사용 여부에 따라 처리 방식 선택
                     if use_yolo_mode and yolo_model is not None:
                         # 🚀 YOLO 기반 빠른 탐지 + ROI 해독
-                        # use_preprocessing=False: 전처리 방법 제거로 속도 향상 (원본이 100% 성공률)
-                        # use_preprocessing=True: 전처리 방법 활성화 (원본 실패 시 추가 시도)
-                        use_preprocessing_mode = False  # True로 변경하면 전처리 방법 활성화
+                        # [최적화] use_preprocessing=False로 설정하여
+                        # 원본 ROI에 대해서만 decode_roi_parallel (원본 버전)을 호출합니다.
+                        use_preprocessing_mode = False 
                         results = process_frame_with_yolo(single_frame, yolo_model, qreader, conf_threshold=0.25, use_preprocessing=use_preprocessing_mode)
                     else:
-                        # 기존 병렬 처리 방식
+                        # 기존 병렬 처리 방식 (비-YOLO 모드)
                         results = process_frame_parallel(single_frame, qreader)
                     
                     # Binary 방법 제거로 파라미터별 결과 출력 로직 제거됨
@@ -1096,7 +1158,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                             if original_method in method_unique_detection_count:
                                 method_unique_detection_count[original_method] += 1
                             
-                            # 시각화 데이터 추가 - 실제 QR 형태 반영
+                            # 시각화 데이터 추가 - ★★★ `quad_xy`가 다시 정밀해짐
                             qr_points = None
                             detection = qr.get('detection')
                             
@@ -1421,7 +1483,9 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("사용법: python video_player_qr.py <비디오_파일_경로>")
+        # ★★★★★ 수정된 부분 ★★★★★
+        # 오류 메시지의 파일 이름을 현재 파일(video_player_qr_parallel.py)로 수정
+        print("사용법: python video_player_qr_parallel.py <비디오_파일_경로>")
         sys.exit(1)
     
     video_path = sys.argv[1]
