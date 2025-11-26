@@ -598,17 +598,25 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         try:
             model_path = 'model1.pt'
             if os.path.exists(model_path):
-                yolo_model = YOLO(model_path)
-                
-                # GPU 사용 여부 확인
+                # GPU 사용 여부 먼저 확인
                 import torch
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                
                 if device == 'cuda':
                     gpu_name = torch.cuda.get_device_name(0)
-                    log_print(f"✅ YOLO 모델 초기화 완료 (GPU: {gpu_name})")
+                    log_print(f"🖥️  GPU 감지: {gpu_name}")
+                else:
+                    log_print("🖥️  GPU 미감지 - CPU 모드로 실행됩니다")
+                    log_print("⚠️ GPU를 사용하려면: 런타임 > 런타임 유형 변경 > GPU 선택")
+                
+                # YOLO 모델 초기화
+                yolo_model = YOLO(model_path)
+                
+                # GPU 사용 여부 재확인 (YOLO가 자동으로 GPU 사용)
+                if device == 'cuda':
+                    log_print(f"✅ YOLO 모델 초기화 완료 (GPU 모드: {gpu_name})")
                 else:
                     log_print("✅ YOLO 모델 초기화 완료 (CPU 모드)")
-                    log_print("⚠️ GPU를 사용하려면: 런타임 > 런타임 유형 변경 > GPU 선택")
             else:
                 log_print(f"⚠️ YOLO 모델 파일을 찾을 수 없습니다: {model_path}")
                 use_yolo_mode = False
