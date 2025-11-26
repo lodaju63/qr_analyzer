@@ -247,6 +247,30 @@ def put_korean_text(img, text, position, font_size=20, color=(0, 255, 0)):
         cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         return img
 
+def calculate_center_distance(bbox1, bbox2):
+    """두 바운딩 박스의 중심점 간 거리 계산"""
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+    
+    # 중심점 계산
+    center1_x = (x1_1 + x2_1) / 2
+    center1_y = (y1_1 + y2_1) / 2
+    center2_x = (x1_2 + x2_2) / 2
+    center2_y = (y1_2 + y2_2) / 2
+    
+    # 유클리드 거리
+    distance = np.sqrt((center1_x - center2_x)**2 + (center1_y - center2_y)**2)
+    
+    # 박스의 대각선 길이로 정규화 (큰 박스 기준)
+    diag1 = np.sqrt((x2_1 - x1_1)**2 + (y2_1 - y1_1)**2)
+    diag2 = np.sqrt((x2_2 - x1_2)**2 + (y2_2 - y1_2)**2)
+    max_diag = max(diag1, diag2)
+    
+    # 정규화된 거리 (0~1 사이)
+    normalized_distance = distance / max_diag if max_diag > 0 else float('inf')
+    
+    return normalized_distance
+
 def get_qr_center_and_bbox(detection):
     """QR의 중심점과 사각형 좌표를 반환"""
     if 'quad_xy' in detection:
@@ -404,34 +428,61 @@ class QRTracker:
             track_text = track.qr_data.get('text', '')
             
             for idx, det in enumerate(detected_bboxes):
+                # IoU 계산
                 iou = calculate_iou(track_bbox, det['bbox'])
-                center_dist = np.sqrt(
-                    (track_center[0] - det['center'][0])**2 + 
-                    (track_center[1] - det['center'][1])**2
-                ) / max(track_bbox[2] - track_bbox[0], track_bbox[3] - track_bbox[1], 1)
                 
+                # 중심점 거리 계산 (로컬용과 동일한 방식)
+                center_dist = calculate_center_distance(track_bbox, det['bbox'])
+                
+                # 텍스트 매칭 확인
                 det_text = det['qr'].get('text', '')
                 text_match = (track_text != '' and det_text != '' and track_text == det_text)
                 
+                # 예측 위치 기반 거리 계산 (일직선 움직임 가정 시 중요)
+                predicted_bbox = track.predict_position()
+                pred_center_dist = None
+                if predicted_bbox is not None and self.linear_motion_boost:
+                    pred_center_dist = calculate_center_distance(predicted_bbox, det['bbox'])
+                
+                # 동적 임계값 (missed_frames가 많을수록 낮춤, 일직선 움직임이므로 더 관대하게)
+                dynamic_iou_threshold = self.iou_threshold * (1.0 - track.missed_frames * 0.05)
+                dynamic_iou_threshold = max(0.05, dynamic_iou_threshold)  # 최소 0.05
+                dynamic_center_dist_threshold = self.center_dist_threshold * (1.0 + track.missed_frames * 0.1)
+                dynamic_center_dist_threshold = min(2.0, dynamic_center_dist_threshold)  # 최대 2.0
+                
+                # 매칭 조건: IoU 또는 중심점 거리 또는 텍스트 매칭 또는 예측 위치 기반 거리
                 matches = False
                 if text_match:
+                    matches = True  # 텍스트 매칭은 항상 허용
+                elif iou >= dynamic_iou_threshold:
                     matches = True
-                elif iou >= self.iou_threshold:
+                elif center_dist <= dynamic_center_dist_threshold:
                     matches = True
-                elif center_dist <= self.center_dist_threshold:
+                elif pred_center_dist is not None and pred_center_dist <= dynamic_center_dist_threshold * 1.2:
+                    # 예측 위치 기반 매칭 (일직선 움직임 가정 시)
                     matches = True
                 
                 if matches:
+                    # 복합 점수 계산 (로컬용과 동일)
                     if text_match:
-                        score = 1000.0 + iou * 100
+                        score = 1000.0 + iou * 100  # 텍스트 매칭 우선
+                    elif pred_center_dist is not None and self.linear_motion_boost:
+                        # 일직선 움직임 가정 시 예측 위치 기반 점수 (가중치 증가)
+                        score = iou * 100 + (1.0 - center_dist) * 50 + (1.0 - pred_center_dist) * 100
                     else:
+                        # IoU와 중심점 거리를 조합한 점수
                         score = iou * 100 + (1.0 - center_dist) * 50
-                    match_scores.append((track_id, idx, score, iou, center_dist, text_match))
+                    
+                    match_scores.append((track_id, idx, score, iou, center_dist, text_match, pred_center_dist))
         
         match_scores.sort(key=lambda x: x[2], reverse=True)
         
         for match_data in match_scores:
-            track_id, detection_idx, score, iou, center_dist, text_match = match_data
+            if len(match_data) == 7:
+                track_id, detection_idx, score, iou, center_dist, text_match, pred_center_dist = match_data
+            else:
+                track_id, detection_idx, score, iou, center_dist, text_match = match_data[:6]
+                pred_center_dist = None
             if track_id in matched_tracks or detection_idx in matched_detections:
                 continue
             
@@ -454,18 +505,26 @@ class QRTracker:
                 track.frame_number = frame_number
         
         tracked_qrs = []
+        
+        # 탐지된 QR (매칭된 것) - 로컬용과 동일한 방식
+        detection_to_track = {}  # {detection_idx: track_id}
+        for match_data in match_scores:
+            if len(match_data) >= 2:
+                track_id = match_data[0]
+                detection_idx = match_data[1]
+                if track_id in matched_tracks and detection_idx in matched_detections:
+                    if detection_idx not in detection_to_track:
+                        detection_to_track[detection_idx] = track_id
+        
         for idx, det in enumerate(detected_bboxes):
-            if idx in matched_detections:
-                for match_data in match_scores:
-                    if match_data[1] == idx and match_data[0] in matched_tracks:
-                        track_id = match_data[0]
-                        track = active_tracks[track_id]
-                        tracked_qrs.append({
-                            **track.qr_data,
-                            'track_id': track_id,
-                            'tracked': True
-                        })
-                        break
+            if idx in matched_detections and idx in detection_to_track:
+                track_id = detection_to_track[idx]
+                track = active_tracks[track_id]
+                tracked_qrs.append({
+                    **track.qr_data,
+                    'track_id': track_id,
+                    'tracked': True
+                })
         
         for track_id, track in active_tracks.items():
             if track_id not in matched_tracks and track.missed_frames > 0:
