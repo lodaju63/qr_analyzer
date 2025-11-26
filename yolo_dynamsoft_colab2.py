@@ -277,19 +277,65 @@ def video_player_with_qr(video_path, output_dir="results", show_preview=False, p
             if item is None: break
             track_id, roi_img = item
             
-            # [전처리] 확대 및 샤픈
-            processed_roi = preprocess_for_decoding(roi_img)
-            
             text = None
             if dbr_reader:
                 try:
-                    # RGB 변환 불필요 (OpenCV 이미지는 BGR, dbr은 자동 처리 혹은 BGR 선호)
-                    # 만약 필요하다면: img_rgb = cv2.cvtColor(processed_roi, cv2.COLOR_BGR2RGB)
-                    res = dbr_reader.capture(processed_roi, dbr.EnumImagePixelFormat.IPF_BGR_888)
-                    decoded = res.get_decoded_barcodes_result()
-                    if decoded and decoded.get_items():
-                        text = decoded.get_items()[0].text
-                except: pass
+                    from dynamsoft_barcode_reader_bundle import dbr as dbr_module
+                    
+                    # [전처리 1] 그레이스케일 변환
+                    if len(roi_img.shape) == 3:
+                        roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+                    else:
+                        roi_gray = roi_img.copy()
+                    
+                    # [전처리 2] CLAHE 적용 (어두운 환경 대비 개선)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                    roi_enhanced = clahe.apply(roi_gray)
+                    
+                    # [전처리 3] 정규화 (대비 끌어올림)
+                    roi_norm = cv2.normalize(roi_enhanced, None, 0, 255, cv2.NORM_MINMAX)
+                    
+                    # [전처리 4] 2배 확대 + 샤픈 (작은 QR 코드용)
+                    roi_upscaled = cv2.resize(roi_norm, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                    kernel = np.array([[-1,-1,-1], [-1, 9,-1], [-1,-1,-1]])
+                    roi_sharpened = cv2.filter2D(roi_upscaled, -1, kernel)
+                    
+                    # [전처리 5] 흰색 테두리 추가
+                    rh, rw = roi_sharpened.shape
+                    border_size = 20
+                    white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
+                    white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_sharpened
+                    
+                    # [전처리 6] RGB로 변환 (Dynamsoft는 RGB를 사용)
+                    roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
+                    
+                    # [해독 시도 1] 원본 이미지 (흰 테두리)
+                    items = None
+                    captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                    barcode_result = captured_result.get_decoded_barcodes_result()
+                    if barcode_result:
+                        items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                        if items and len(items) > 0:
+                            text = items[0].text if hasattr(items[0], 'text') else items[0].get_text()
+                    
+                    # [해독 시도 2] 반전 이미지 (검은 테두리) - 원본 실패 시
+                    if not text:
+                        roi_inverted_gray = cv2.bitwise_not(roi_sharpened)
+                        black_canvas = np.full((rh + border_size*2, rw + border_size*2), 0, dtype=np.uint8)
+                        black_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_inverted_gray
+                        roi_rgb_inverted = cv2.cvtColor(black_canvas, cv2.COLOR_GRAY2RGB)
+                        
+                        captured_result_inverted = dbr_reader.capture(roi_rgb_inverted, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                        barcode_result_inverted = captured_result_inverted.get_decoded_barcodes_result()
+                        if barcode_result_inverted:
+                            items_inv = barcode_result_inverted.get_items() if hasattr(barcode_result_inverted, 'get_items') else None
+                            if items_inv and len(items_inv) > 0:
+                                text = items_inv[0].text if hasattr(items_inv[0], 'text') else items_inv[0].get_text()
+                
+                except Exception as e:
+                    # 디버깅을 위해 에러 출력 (선택사항)
+                    # print(f"해독 오류 (track_id={track_id}): {e}")
+                    pass
             
             if text:
                 with lock:
