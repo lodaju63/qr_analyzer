@@ -67,8 +67,9 @@ uploaded = files.upload()  # video.mp4 선택
 **코드 파일은 GitHub에서 가져오는 것이 편리합니다:**
 
 ```python
-# 코드 파일 다운로드
-!wget https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 코드 파일 다운로드 (기존 파일 덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 
 # 모델/비디오 파일은 GitHub에 올려두고 다운로드 (또는 Drive 사용)
 ```
@@ -83,7 +84,9 @@ uploaded = files.upload()  # yolo_dynamsoft_colab.py 선택
 
 또는 GitHub에서 직접 가져오기:
 ```python
-!wget https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 기존 파일 삭제 후 다운로드 (덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 ```
 
 ## 🚀 실행 방법
@@ -131,8 +134,9 @@ uploaded = files.upload()  # model1.pt 선택
 print("\n비디오 파일 업로드:")
 uploaded = files.upload()  # video.mp4 선택
 
-# 3. 코드 파일 가져오기
-!wget https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 3. 코드 파일 가져오기 (기존 파일 덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 
 # 4. 실행
 from yolo_dynamsoft_colab import video_player_with_qr
@@ -284,8 +288,9 @@ files.upload()
 !pip install -q ultralytics opencv-python numpy pillow dynamsoft-barcode-reader-bundle
 !apt-get -qq install -y fonts-nanum
 
-# 2. 코드 파일은 GitHub에서 자동으로 가져오기
-!wget -q https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 2. 코드 파일은 GitHub에서 자동으로 가져오기 (기존 파일 덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -q -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 
 # 3. 파일 업로드 또는 Drive에서 복사
 # (위의 방법 A 또는 B 참고)
@@ -390,8 +395,9 @@ video_player_with_qr(
 from google.colab import drive
 drive.mount('/content/drive')
 
-# 3. 코드 다운로드
-!wget -q https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 3. 코드 다운로드 (기존 파일 덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -q -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 
 # 4. Drive에서 파일 복사 (최초 1회만 Drive에 업로드 필요)
 #    - Google Drive 웹에서 직접 업로드하거나
@@ -426,8 +432,9 @@ video_player_with_qr(
 !pip install -q ultralytics opencv-python numpy pillow dynamsoft-barcode-reader-bundle
 !apt-get -qq install -y fonts-nanum
 
-# 2. 코드 다운로드
-!wget -q https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
+# 2. 코드 다운로드 (기존 파일 덮어쓰기)
+!rm -f yolo_dynamsoft_colab.py
+!wget -q -O yolo_dynamsoft_colab.py https://raw.githubusercontent.com/lodaju63/md/feat/dynamsoft/yolo_dynamsoft_colab.py
 
 # 3. 파일 업로드 (수동)
 from google.colab import files
