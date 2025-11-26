@@ -507,11 +507,17 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     log_file_path = os.path.join(output_run_dir, f"qr_detection_log_{run_id}.txt")
     log_file = open(log_file_path, 'w', encoding='utf-8')
+    log_file_closed = False
     
     def log_print(message):
         print(message)
-        log_file.write(message + '\n')
-        log_file.flush()
+        try:
+            if not log_file_closed and not log_file.closed:
+                log_file.write(message + '\n')
+                log_file.flush()
+        except (ValueError, AttributeError):
+            # 파일이 닫혔거나 오류 발생 시 콘솔에만 출력
+            pass
     
     log_print(f"🖥️  구글 코랩 환경에서 실행 중")
     log_print(f"📁 결과 폴더: {output_run_dir}")
@@ -866,9 +872,8 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         
         out_video.release()
         cap.release()
-        log_file.close()
     
-    # 최종 통계
+    # 최종 통계 (파일 닫기 전에 출력)
     total_end_time = time.time()
     total_execution_time = total_end_time - total_start_time
     
@@ -881,6 +886,14 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     log_print(f"  ❌ 실패: {failed_count}개")
     log_print(f"  결과 저장: {output_run_dir}/")
     log_print(f"  📹 출력 영상: {output_video_path}")
+    
+    # 이제 파일 닫기
+    try:
+        if not log_file.closed:
+            log_file.close()
+        log_file_closed = True
+    except:
+        pass
     
     print(f"\n✅ 처리 완료!")
     print(f"📹 출력 영상: {output_video_path}")
