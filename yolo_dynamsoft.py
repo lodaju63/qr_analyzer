@@ -71,33 +71,124 @@ def _process_decoded_text(decoded_text):
     
     return decoded_text
 
-def yolo_detect_qr_locations(model, frame, conf_threshold=0.25):
-    """YOLO 모델로 QR 코드 위치 빠르게 탐지"""
+def preprocess_frame_for_detection(frame, use_clahe=True, use_normalize=True, clahe_clip_limit=2.0):
+    """
+    탐지 성능 향상을 위한 프레임 전처리
+    - 대비가 낮은 QR 코드 (검정 QR/검정 배경, 하얀 QR/하얀 배경) 탐지 개선
+    
+    Args:
+        frame: 입력 프레임 (BGR)
+        use_clahe: CLAHE 적용 여부 (기본: True)
+        use_normalize: 정규화 적용 여부 (기본: True)
+        clahe_clip_limit: CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함, 오탐지 감소)
+    
+    Returns:
+        processed: 전처리된 프레임 (BGR)
+    """
     try:
-        results = model(frame, conf=conf_threshold, verbose=False)
-        result = results[0]
+        # 1. 그레이스케일 변환
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame.copy()
         
-        locations = []
-        if result.boxes is not None and len(result.boxes) > 0:
-            for box in result.boxes:
-                conf = float(box.conf[0])
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-                
-                # 패딩 추가 (QR 코드 경계 확보)
-                pad = 20
-                h, w = frame.shape[:2]
-                x1 = max(0, x1 - pad)
-                y1 = max(0, y1 - pad)
-                x2 = min(w, x2 + pad)
-                y2 = min(h, y2 + pad)
-                
-                locations.append({
-                    'bbox': [x1, y1, x2, y2],
-                    'confidence': conf
-                })
+        # 2. CLAHE 적용 (어두운/밝은 영역 대비 개선)
+        if use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+        else:
+            enhanced = gray
         
-        return locations
+        # 3. 정규화 (대비 끌어올림)
+        if use_normalize:
+            normalized = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX)
+        else:
+            normalized = enhanced
+        
+        # 4. BGR로 변환 (YOLO는 3채널 입력 필요)
+        processed = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
+        
+        return processed
+    except:
+        return frame
+
+def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessing=False, 
+                             use_clahe=True, use_normalize=True, clahe_clip_limit=2.0, 
+                             detect_both_frames=True, iou_threshold=0.5):
+    """YOLO 모델로 QR 코드 위치 빠르게 탐지
+    
+    Args:
+        model: YOLO 모델
+        frame: 입력 프레임 (BGR)
+        conf_threshold: 신뢰도 임계값
+        use_preprocessing: 전처리 사용 여부
+        use_clahe: CLAHE 적용 여부
+        use_normalize: 정규화 적용 여부
+        clahe_clip_limit: CLAHE clipLimit 값
+        detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부
+        iou_threshold: IoU 임계값 (중복 제거용)
+    
+    Returns:
+        locations: [{'bbox': [x1, y1, x2, y2], 'confidence': float}, ...]
+    """
+    try:
+        all_locations = []
+        
+        # 탐지할 프레임 목록
+        frames_to_detect = []
+        if use_preprocessing:
+            processed_frame = preprocess_frame_for_detection(frame, use_clahe=use_clahe, 
+                                                           use_normalize=use_normalize, 
+                                                           clahe_clip_limit=clahe_clip_limit)
+            if detect_both_frames:
+                frames_to_detect = [processed_frame, frame]
+            else:
+                frames_to_detect = [processed_frame]
+        else:
+            frames_to_detect = [frame]
+        
+        for detect_frame in frames_to_detect:
+            results = model(detect_frame, conf=conf_threshold, verbose=False)
+            result = results[0]
+            
+            if result.boxes is not None and len(result.boxes) > 0:
+                h_orig, w_orig = frame.shape[:2]
+                h_detect, w_detect = detect_frame.shape[:2]
+                
+                # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
+                scale_x = w_orig / w_detect if w_detect > 0 else 1.0
+                scale_y = h_orig / h_detect if h_detect > 0 else 1.0
+                
+                for box in result.boxes:
+                    conf = float(box.conf[0])
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = map(int, xyxy)
+                    
+                    # 원본 프레임 좌표로 변환
+                    x1 = int(x1 * scale_x)
+                    y1 = int(y1 * scale_y)
+                    x2 = int(x2 * scale_x)
+                    y2 = int(y2 * scale_y)
+                    
+                    # 패딩 추가 (QR 코드 경계 확보)
+                    pad = 20
+                    h, w = frame.shape[:2]
+                    x1 = max(0, x1 - pad)
+                    y1 = max(0, y1 - pad)
+                    x2 = min(w, x2 + pad)
+                    y2 = min(h, y2 + pad)
+                    
+                    all_locations.append({
+                        'bbox': [x1, y1, x2, y2],
+                        'confidence': conf
+                    })
+        
+        # 중복 제거 (IoU 기반)
+        if len(all_locations) > 1:
+            filtered_locations = filter_overlapping_yolo_rois(all_locations, iou_threshold=iou_threshold)
+            return filtered_locations
+        
+        return all_locations
     except Exception as e:
         return []
 
@@ -172,30 +263,37 @@ def filter_overlapping_yolo_rois(locations, iou_threshold=0.5):
 # `process_frame_with_yolo`가 `filter_overlapping_yolo_rois`를
 # 호출하도록 수정합니다.
 # -----------------------------------------------------------------
-def process_frame_with_yolo(frame, yolo_model, conf_threshold=0.25):
+def process_frame_with_yolo(frame, yolo_model, conf_threshold=0.25, use_preprocessing=False,
+                            use_clahe=True, use_normalize=True, clahe_clip_limit=2.0, 
+                            detect_both_frames=True, iou_threshold=0.5):
     """YOLO로 빠르게 위치만 탐지 (해독 제거, 비동기 해독으로 분리)
     
     Args:
         frame: 입력 프레임
         yolo_model: YOLO 모델
         conf_threshold: YOLO 신뢰도 임계값
+        use_preprocessing: 전처리 사용 여부
+        use_clahe: CLAHE 적용 여부
+        use_normalize: 정규화 적용 여부
+        clahe_clip_limit: CLAHE clipLimit 값
+        detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부
+        iou_threshold: IoU 임계값
     
     Returns:
         filtered_locations: 필터링된 QR 위치 리스트 [{'bbox': [x1, y1, x2, y2], 'confidence': float}, ...]
     """
     # 1단계: YOLO로 빠르게 QR 코드 위치 탐지
     if yolo_model is not None:
-        qr_locations = yolo_detect_qr_locations(yolo_model, frame, conf_threshold)
+        qr_locations = yolo_detect_qr_locations(yolo_model, frame, conf_threshold, 
+                                               use_preprocessing=use_preprocessing,
+                                               use_clahe=use_clahe,
+                                               use_normalize=use_normalize,
+                                               clahe_clip_limit=clahe_clip_limit,
+                                               detect_both_frames=detect_both_frames,
+                                               iou_threshold=iou_threshold)
         
-        # ★★★★★ 새로운 최적화 단계 ★★★★★
-        # 겹치는 ROI를 먼저 제거
-        filtered_locations = filter_overlapping_yolo_rois(qr_locations, iou_threshold=0.5)
-        
-        # ROI 필터링 결과 (필요시 주석 해제)
-        # if len(qr_locations) > len(filtered_locations):
-        #     print(f"    ⚡ ROI 필터링: {len(qr_locations)}개 -> {len(filtered_locations)}개")
-        
-        return filtered_locations
+        # 중복 제거는 yolo_detect_qr_locations 내부에서 이미 수행됨
+        return qr_locations
     
     return []
 
@@ -757,8 +855,23 @@ class QRTracker:
         return len([t for t in self.tracks.values() if t.missed_frames <= self.max_missed_frames])
 
 
-def video_player_with_qr(video_path, output_dir="video_player_results"):
-    """영상 플레이어 + 실시간 QR 탐지"""
+def video_player_with_qr(video_path, output_dir="video_player_results", 
+                         use_preprocessing=False, use_clahe=True, use_normalize=True,
+                         clahe_clip_limit=2.0, detect_both_frames=True, conf_threshold=0.25,
+                         iou_threshold=0.5):
+    """영상 플레이어 + 실시간 QR 탐지
+    
+    Args:
+        video_path: 비디오 파일 경로
+        output_dir: 출력 디렉토리
+        use_preprocessing: 전처리 사용 여부 (기본: False)
+        use_clahe: CLAHE 적용 여부 (기본: True)
+        use_normalize: 정규화 적용 여부 (기본: True)
+        clahe_clip_limit: CLAHE clipLimit 값 (기본: 2.0)
+        detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부 (기본: True)
+        conf_threshold: YOLO 신뢰도 임계값 (기본: 0.25)
+        iou_threshold: IoU 임계값 (기본: 0.5)
+    """
     
     # 🕐 전체 실행 시간 측정 시작
     total_start_time = time.time()
@@ -1381,7 +1494,14 @@ def video_player_with_qr(video_path, output_dir="video_player_results"):
                     # YOLO 모드 사용 여부에 따라 처리 방식 선택
                     if use_yolo_mode and yolo_model is not None:
                         # 🚀 YOLO 기반 빠른 탐지만 수행 (해독은 비동기로 분리)
-                        filtered_locations = process_frame_with_yolo(single_frame, yolo_model, conf_threshold=0.25)
+                        filtered_locations = process_frame_with_yolo(single_frame, yolo_model, 
+                                                                      conf_threshold=conf_threshold,
+                                                                      use_preprocessing=use_preprocessing,
+                                                                      use_clahe=use_clahe,
+                                                                      use_normalize=use_normalize,
+                                                                      clahe_clip_limit=clahe_clip_limit,
+                                                                      detect_both_frames=detect_both_frames,
+                                                                      iou_threshold=iou_threshold)
                         
                         # 탐지 결과를 추적 형식으로 변환
                         detected_qrs = []
@@ -1980,5 +2100,46 @@ if __name__ == "__main__":
         print("사용법: python video_synch.py <비디오_파일_경로>")
         sys.exit(1)
     
-    video_path = sys.argv[1]
-    video_player_with_qr(video_path)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='영상 플레이어 + 실시간 QR 탐지')
+    parser.add_argument('video_path', type=str, help='비디오 파일 경로')
+    parser.add_argument('--output', type=str, default='video_player_results', help='출력 디렉토리 (기본: video_player_results)')
+    
+    # YOLO 탐지 옵션
+    parser.add_argument('--conf', type=float, default=0.25, help='YOLO 신뢰도 임계값 (기본: 0.25)')
+    parser.add_argument('--iou', type=float, default=0.5, help='겹침 임계값 (기본: 0.5)')
+    
+    # 전처리 옵션
+    parser.add_argument('--preprocessing', action='store_true', help='전처리 사용 (CLAHE + 정규화)')
+    parser.add_argument('--no-clahe', action='store_true', help='CLAHE 전처리 사용 안 함')
+    parser.add_argument('--no-normalize', action='store_true', help='정규화 전처리 사용 안 함')
+    parser.add_argument('--clahe-clip-limit', type=float, default=2.0, help='CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함/오탐지 감소)')
+    parser.add_argument('--single-frame', action='store_true', help='원본과 전처리 프레임 중 하나만 탐지 (기본: 둘 다 탐지)')
+    
+    args = parser.parse_args()
+    
+    # 전처리 옵션 파싱
+    use_preprocessing = args.preprocessing
+    use_clahe = not args.no_clahe if use_preprocessing else False
+    use_normalize = not args.no_normalize if use_preprocessing else False
+    detect_both_frames = not args.single_frame
+    
+    video_player_with_qr(
+        video_path=args.video_path,
+        output_dir=args.output,
+        use_preprocessing=use_preprocessing,
+        use_clahe=use_clahe,
+        use_normalize=use_normalize,
+        clahe_clip_limit=args.clahe_clip_limit,
+        detect_both_frames=detect_both_frames,
+        conf_threshold=args.conf,
+        iou_threshold=args.iou
+    )
+
+    # --conf 0.25 신뢰도
+    # --iou	0.5 겹침 임계값
+    # --clahe-clip-limit 2.0 clahe 클립 제한
+    # --preprocessing 전처리 사용
+    # --no-clahe	clahe 사용 안 함
+    # --no-normalize 정규화 사용 안함

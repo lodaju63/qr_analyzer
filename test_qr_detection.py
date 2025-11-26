@@ -116,7 +116,54 @@ def filter_overlapping_detections(detections, iou_threshold=0.5):
     return filtered
 
 
-def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5):
+def preprocess_frame_for_detection(frame, use_clahe=True, use_normalize=True, clahe_clip_limit=2.0):
+    """
+    탐지 성능 향상을 위한 프레임 전처리
+    - 대비가 낮은 QR 코드 (검정 QR/검정 배경, 하얀 QR/하얀 배경) 탐지 개선
+    
+    Args:
+        frame: 입력 프레임 (BGR)
+        use_clahe: CLAHE 적용 여부 (기본: True)
+        use_normalize: 정규화 적용 여부 (기본: True)
+        clahe_clip_limit: CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함, 오탐지 감소)
+    
+    Returns:
+        processed: 전처리된 프레임 (BGR)
+    """
+    try:
+        processed = frame.copy()
+        
+        # 1. 그레이스케일 변환
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame.copy()
+        
+        # 2. CLAHE 적용 (어두운/밝은 영역 대비 개선)
+        # clipLimit을 낮추면 대비 개선이 완화되어 오탐지 감소
+        if use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+        else:
+            enhanced = gray
+        
+        # 3. 정규화 (대비 끌어올림)
+        if use_normalize:
+            normalized = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX)
+        else:
+            normalized = enhanced
+        
+        # 4. BGR로 변환 (YOLO는 3채널 입력 필요)
+        processed = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
+        
+        return processed
+    except:
+        return frame
+
+
+def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5, 
+                        use_preprocessing=True, use_clahe=True, use_normalize=True, 
+                        detect_both_frames=True, clahe_clip_limit=2.0):
     """
     YOLO 모델로 QR 코드 위치 탐지
     
@@ -125,6 +172,10 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5):
         frame: 입력 프레임 (BGR)
         conf_threshold: 신뢰도 임계값 (기본: 0.25)
         iou_threshold: 겹침 임계값 (기본: 0.5)
+        use_preprocessing: 전처리 사용 여부 (기본: True)
+        use_clahe: CLAHE 적용 여부 (기본: True)
+        use_normalize: 정규화 적용 여부 (기본: True)
+        detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부 (기본: True)
     
     Returns:
         detections: [{'bbox': [x1, y1, x2, y2], 'confidence': float}, ...]
@@ -132,31 +183,65 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5):
     detections = []
     
     try:
-        # YOLO 탐지
-        results = model(frame, conf=conf_threshold, verbose=False, imgsz=640)
-        result = results[0]
+        # 전처리 적용 (대비 낮은 QR 탐지 개선)
+        if use_preprocessing:
+            processed_frame = preprocess_frame_for_detection(frame, use_clahe=use_clahe, use_normalize=use_normalize, 
+                                                           clahe_clip_limit=clahe_clip_limit)
+        else:
+            processed_frame = frame
         
-        if result.boxes is not None and len(result.boxes) > 0:
-            for box in result.boxes:
-                conf = float(box.conf[0])
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-                
-                # 패딩 추가 (QR 코드 경계 확보)
-                pad = 20
-                h, w = frame.shape[:2]
-                x1 = max(0, x1 - pad)
-                y1 = max(0, y1 - pad)
-                x2 = min(w, x2 + pad)
-                y2 = min(h, y2 + pad)
-                
-                detections.append({
-                    'bbox': [x1, y1, x2, y2],
-                    'confidence': conf
-                })
+        # 탐지할 프레임 목록
+        frames_to_detect = []
+        if use_preprocessing and detect_both_frames:
+            # 전처리된 프레임과 원본 프레임 모두 탐지
+            frames_to_detect = [processed_frame, frame]
+        elif use_preprocessing:
+            # 전처리된 프레임만 탐지
+            frames_to_detect = [processed_frame]
+        else:
+            # 원본만 탐지
+            frames_to_detect = [frame]
         
-        # Overlap threshold 적용 (NMS)
-        detections = filter_overlapping_detections(detections, iou_threshold=iou_threshold)
+        all_detections = []
+        
+        for detect_frame in frames_to_detect:
+            # YOLO 탐지
+            results = model(detect_frame, conf=conf_threshold, verbose=False, imgsz=640)
+            result = results[0]
+            
+            if result.boxes is not None and len(result.boxes) > 0:
+                h_orig, w_orig = frame.shape[:2]
+                h_detect, w_detect = detect_frame.shape[:2]
+                
+                # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
+                scale_x = w_orig / w_detect if w_detect > 0 else 1.0
+                scale_y = h_orig / h_detect if h_detect > 0 else 1.0
+                
+                for box in result.boxes:
+                    conf = float(box.conf[0])
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = map(int, xyxy)
+                    
+                    # 원본 프레임 좌표로 변환
+                    x1 = int(x1 * scale_x)
+                    y1 = int(y1 * scale_y)
+                    x2 = int(x2 * scale_x)
+                    y2 = int(y2 * scale_y)
+                    
+                    # 패딩 추가 (QR 코드 경계 확보)
+                    pad = 20
+                    x1 = max(0, x1 - pad)
+                    y1 = max(0, y1 - pad)
+                    x2 = min(w_orig, x2 + pad)
+                    y2 = min(h_orig, y2 + pad)
+                    
+                    all_detections.append({
+                        'bbox': [x1, y1, x2, y2],
+                        'confidence': conf
+                    })
+        
+        # Overlap threshold 적용 (NMS) - 중복 제거
+        detections = filter_overlapping_detections(all_detections, iou_threshold=iou_threshold)
     
     except Exception as e:
         print(f"⚠️ 탐지 오류: {e}")
@@ -166,7 +251,9 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5):
     return detections
 
 
-def test_single_image(model, image_path, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5, save_result=True):
+def test_single_image(model, image_path, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5, 
+                     save_result=True, use_preprocessing=True, use_clahe=True, use_normalize=True, detect_both_frames=True,
+                     clahe_clip_limit=2.0):
     """단일 이미지에서 QR 코드 탐지 테스트"""
     
     # 이미지 읽기
@@ -183,7 +270,10 @@ def test_single_image(model, image_path, output_dir="test_results", conf_thresho
     
     # QR 코드 탐지
     start_time = time.time()
-    detections = detect_qr_with_yolo(model, frame, conf_threshold, iou_threshold)
+    detections = detect_qr_with_yolo(model, frame, conf_threshold, iou_threshold, 
+                                     use_preprocessing=use_preprocessing, use_clahe=use_clahe, 
+                                     use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                                     clahe_clip_limit=clahe_clip_limit)
     detect_time = time.time() - start_time
     
     # 결과 시각화
@@ -199,7 +289,7 @@ def test_single_image(model, image_path, output_dir="test_results", conf_thresho
         # 신뢰도 표시
         text = f"QR{i+1}: {conf:.2f}"
         text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
-        result_frame = put_korean_text(result_frame, text, text_pos, font_size=16, color=(0, 255, 0))
+        result_frame = put_korean_text(result_frame, text, text_pos, font_size=28, color=(0, 255, 0))
     
     # 정보 표시
     info_text = f"Detections: {len(detections)} | Time: {detect_time*1000:.1f}ms | Conf: {conf_threshold} | IoU: {iou_threshold}"
@@ -233,7 +323,9 @@ def test_single_image(model, image_path, output_dir="test_results", conf_thresho
     return result_info
 
 
-def test_image_batch(model, image_dir, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5):
+def test_image_batch(model, image_dir, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5,
+                    use_preprocessing=True, use_clahe=True, use_normalize=True, detect_both_frames=True,
+                    clahe_clip_limit=2.0):
     """여러 이미지를 일괄 테스트"""
     
     if not os.path.exists(image_dir):
@@ -272,7 +364,10 @@ def test_image_batch(model, image_dir, output_dir="test_results", conf_threshold
     for idx, image_path in enumerate(image_files, 1):
         print(f"[{idx}/{total_images}] 처리 중: {image_path.name}...", end=' ')
         
-        result = test_single_image(model, str(image_path), output_dir, conf_threshold, iou_threshold, save_result=True)
+        result = test_single_image(model, str(image_path), output_dir, conf_threshold, iou_threshold, 
+                                  save_result=True, use_preprocessing=use_preprocessing, use_clahe=use_clahe,
+                                  use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                                  clahe_clip_limit=clahe_clip_limit)
         
         if result:
             all_results.append(result)
@@ -341,7 +436,9 @@ def test_image_batch(model, image_dir, output_dir="test_results", conf_threshold
     print(f"💾 이미지 결과 저장: {output_dir}/")
 
 
-def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5, max_frames=None, show_display=True):
+def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25, iou_threshold=0.5, 
+              max_frames=None, show_display=True, use_preprocessing=True, use_clahe=True, 
+              use_normalize=True, detect_both_frames=True, clahe_clip_limit=2.0):
     """비디오에서 QR 코드 탐지 테스트 (화면 표시 포함)"""
     
     print(f"\n{'='*60}")
@@ -427,7 +524,10 @@ def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25
                 
                 # QR 코드 탐지
                 detect_start = time.time()
-                detections = detect_qr_with_yolo(model, frame, conf_threshold, iou_threshold)
+                detections = detect_qr_with_yolo(model, frame, conf_threshold, iou_threshold,
+                                                 use_preprocessing=use_preprocessing, use_clahe=use_clahe,
+                                                 use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                                                 clahe_clip_limit=clahe_clip_limit)
                 detect_time = time.time() - detect_start
                 total_detect_time += detect_time
                 
@@ -453,7 +553,7 @@ def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25
                     # 신뢰도 표시
                     text = f"QR{i+1}: {conf:.2f}"
                     text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
-                    result_frame = put_korean_text(result_frame, text, text_pos, font_size=14, color=(0, 255, 0))
+                    result_frame = put_korean_text(result_frame, text, text_pos, font_size=28, color=(0, 255, 0))
                 
                 # 정보 표시
                 current_fps = 1.0 / detect_time if detect_time > 0 else 0
@@ -546,6 +646,14 @@ def main():
     parser.add_argument('--max-frames', type=int, default=None, help='비디오 최대 처리 프레임 수 (기본: 전체)')
     parser.add_argument('--no-display', action='store_true', help='비디오 화면 표시 안 함 (진행 상황만 출력)')
     
+    # 전처리 옵션 (각 방법의 효과를 테스트하기 위해)
+    parser.add_argument('--no-preprocessing', action='store_true', help='전처리 사용 안 함 (원본만 사용)')
+    parser.add_argument('--no-clahe', action='store_true', help='CLAHE 전처리 사용 안 함')
+    parser.add_argument('--no-normalize', action='store_true', help='정규화 전처리 사용 안 함')
+    parser.add_argument('--single-frame', action='store_true', help='원본과 전처리 프레임 중 하나만 탐지 (기본: 둘 다 탐지)')
+    parser.add_argument('--test-all', action='store_true', help='모든 전처리 조합을 테스트하고 결과 비교')
+    parser.add_argument('--clahe-clip-limit', type=float, default=2.0, help='CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함/오탐지 감소, 높을수록 대비 개선 강함/오탐지 증가)')
+    
     args = parser.parse_args()
     
     # YOLO 모델 로드
@@ -566,24 +674,115 @@ def main():
         print(f"❌ 입력 경로를 찾을 수 없습니다: {args.input_path}")
         sys.exit(1)
     
-    # 파일 타입 확인
+    # 전처리 옵션 파싱
+    use_preprocessing = not args.no_preprocessing
+    use_clahe = not args.no_clahe if use_preprocessing else False
+    use_normalize = not args.no_normalize if use_preprocessing else False
+    detect_both_frames = not args.single_frame
+    
+    # 전처리 설정 출력
+    print(f"\n📋 전처리 설정:")
+    print(f"   전처리 사용: {'ON' if use_preprocessing else 'OFF'}")
+    if use_preprocessing:
+        print(f"   CLAHE: {'ON' if use_clahe else 'OFF'}")
+        if use_clahe:
+            print(f"   CLAHE clipLimit: {args.clahe_clip_limit} (낮을수록 대비 개선 약함/오탐지 감소)")
+        print(f"   정규화: {'ON' if use_normalize else 'OFF'}")
+        print(f"   원본+전처리 모두 탐지: {'ON' if detect_both_frames else 'OFF'}")
+    print()
+    
+    # 모든 조합 테스트 모드
+    if args.test_all:
+        print("🧪 모든 전처리 조합 테스트 모드")
+        print("="*60)
+        
+        # 테스트할 조합들
+        test_configs = [
+            {"name": "원본만", "use_preprocessing": False, "use_clahe": False, "use_normalize": False, "detect_both_frames": False},
+            {"name": "CLAHE만", "use_preprocessing": True, "use_clahe": True, "use_normalize": False, "detect_both_frames": False},
+            {"name": "정규화만", "use_preprocessing": True, "use_clahe": False, "use_normalize": True, "detect_both_frames": False},
+            {"name": "CLAHE+정규화", "use_preprocessing": True, "use_clahe": True, "use_normalize": True, "detect_both_frames": False},
+            {"name": "CLAHE+정규화+원본도", "use_preprocessing": True, "use_clahe": True, "use_normalize": True, "detect_both_frames": True},
+        ]
+        
+        results = []
+        file_ext = Path(args.input_path).suffix.lower() if not os.path.isdir(args.input_path) else None
+        
+        for config in test_configs:
+            print(f"\n{'='*60}")
+            print(f"테스트: {config['name']}")
+            print(f"{'='*60}")
+            
+            if os.path.isdir(args.input_path):
+                # 이미지 배치 테스트
+                test_image_batch(model, args.input_path, 
+                               os.path.join(args.output, config['name'].replace('+', '_')), 
+                               args.conf, args.iou,
+                               config['use_preprocessing'], config['use_clahe'], 
+                               config['use_normalize'], config['detect_both_frames'],
+                               clahe_clip_limit=args.clahe_clip_limit)
+            elif file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                # 단일 이미지 테스트
+                result = test_single_image(model, args.input_path, 
+                                         os.path.join(args.output, config['name'].replace('+', '_')), 
+                                         args.conf, args.iou, save_result=True,
+                                         use_preprocessing=config['use_preprocessing'],
+                                         use_clahe=config['use_clahe'],
+                                         use_normalize=config['use_normalize'],
+                                         detect_both_frames=config['detect_both_frames'],
+                                         clahe_clip_limit=args.clahe_clip_limit)
+                if result:
+                    results.append({
+                        'config': config['name'],
+                        'detections': result['detections'],
+                        'time_ms': result['detect_time_ms']
+                    })
+            elif file_ext in ['.mp4', '.avi', '.mov', '.mkv']:
+                # 비디오 테스트 (간단한 통계만)
+                print("   비디오는 조합 테스트에서 제외됩니다. 개별 테스트를 사용하세요.")
+        
+        # 결과 비교
+        if results:
+            print(f"\n{'='*60}")
+            print("📊 테스트 결과 비교")
+            print(f"{'='*60}")
+            print(f"{'조합':<30} {'탐지 개수':<15} {'처리 시간(ms)':<15}")
+            print("-"*60)
+            for r in results:
+                print(f"{r['config']:<30} {r['detections']:<15} {r['time_ms']:.1f}")
+            print(f"{'='*60}")
+        
+        return
+    
+    # 일반 모드 (단일 설정)
     if os.path.isdir(args.input_path):
         # 디렉토리: 일괄 이미지 테스트
-        test_image_batch(model, args.input_path, args.output, args.conf, args.iou)
+        test_image_batch(model, args.input_path, args.output, args.conf, args.iou,
+                        use_preprocessing=use_preprocessing, use_clahe=use_clahe,
+                        use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                        clahe_clip_limit=args.clahe_clip_limit)
     else:
         # 파일: 단일 파일 테스트
         file_ext = Path(args.input_path).suffix.lower()
         
         if file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
             # 이미지 테스트
-            result = test_single_image(model, args.input_path, args.output, args.conf, args.iou, save_result=True)
+            result = test_single_image(model, args.input_path, args.output, args.conf, args.iou, 
+                                     save_result=True,
+                                     use_preprocessing=use_preprocessing, use_clahe=use_clahe,
+                                     use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                                     clahe_clip_limit=args.clahe_clip_limit)
             if result:
                 print(f"\n✅ 탐지 완료: {result['detections']}개 QR 코드 발견")
                 print(f"   처리 시간: {result['detect_time_ms']:.1f}ms")
         elif file_ext in ['.mp4', '.avi', '.mov', '.mkv']:
             # 비디오 테스트
             show_display = not args.no_display
-            test_video(model, args.input_path, args.output, args.conf, args.iou, args.max_frames, show_display=show_display)
+            test_video(model, args.input_path, args.output, args.conf, args.iou, args.max_frames, 
+                      show_display=show_display,
+                      use_preprocessing=use_preprocessing, use_clahe=use_clahe,
+                      use_normalize=use_normalize, detect_both_frames=detect_both_frames,
+                      clahe_clip_limit=args.clahe_clip_limit)
         else:
             print(f"❌ 지원하지 않는 파일 형식입니다: {file_ext}")
             print("   지원 형식: .jpg, .jpeg, .png, .bmp, .mp4, .avi, .mov, .mkv")
@@ -593,3 +792,26 @@ def main():
 if __name__ == "__main__":
     main()
 
+# 1. 원본만 (전처리 없음)
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --no-preprocessing --no-display
+
+# 2. CLAHE만 사용 (원본+CLAHE 탐지)
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --no-normalize --no-display
+
+# 3. 정규화만 사용
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --no-clahe --no-display
+
+# 4. 전처리 프레임만 탐지 (원본 제외)
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --single-frame --no-display
+
+# 5. 기본 설정 (CLAHE + 정규화 + 원본도 탐지)
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --no-display
+
+# 6. CLAHE 강도 낮춰서 오탐지 감소 (clipLimit: 1.5)
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --clahe-clip-limit 1.5 --no-display
+
+# 7. CLAHE 강도 더 낮춤 (clipLimit: 1.0) - 오탐지 최소화
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --clahe-clip-limit 1.0 --no-display
+
+# 8. Confidence threshold 높여서 오탐지 감소
+#python test_qr_detection.py "data\video\sample_video3-1.mp4" --conf 0.4 --no-display

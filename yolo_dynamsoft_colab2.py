@@ -431,6 +431,14 @@ def video_player_with_qr(video_path, output_dir="results", show_preview=False, p
         t_worker.join()
         print(f"\n\n완료! 결과 파일: {out_path}")
         
-        # 코랩에서 영상 다운로드 쉽게 하도록
+        # 코랩에서 영상 직접 재생 (다운로드 없이)
         if IN_COLAB and os.path.exists(out_path):
+            try:
+                from IPython.display import Video
+                print(f"\n📹 코랩에서 영상 재생 중...")
+                display(Video(out_path, width=800))
+            except Exception as e:
+                print(f"⚠️ 영상 재생 실패: {e}")
+                print(f"영상을 다운로드 하려면 왼쪽 파일 탐색기에서 {output_dir} 폴더를 확인하세요.")
+        elif os.path.exists(out_path):
             print(f"영상을 다운로드 하려면 왼쪽 파일 탐색기에서 {output_dir} 폴더를 확인하세요.")
