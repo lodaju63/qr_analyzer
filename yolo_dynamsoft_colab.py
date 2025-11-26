@@ -1114,4 +1114,3 @@ if __name__ == "__main__":
     
     video_path = sys.argv[1]
     video_player_with_qr(video_path, show_preview=True)
-
