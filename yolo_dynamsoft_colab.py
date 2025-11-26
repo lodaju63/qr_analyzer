@@ -553,7 +553,7 @@ class QRTracker:
         return len([t for t in self.tracks.values() if t.missed_frames <= self.max_missed_frames])
 
 def video_player_with_qr(video_path, output_dir="video_player_results", 
-                         show_preview=True, preview_interval=30):
+                         show_preview=True, preview_interval=30, verbose_log=False):
     """영상 플레이어 + 실시간 QR 탐지 (코랩용)"""
     
     total_start_time = time.time()
@@ -835,12 +835,42 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                         if track_id is not None:
                             with decode_lock:
                                 if track_id in decode_results:
+                                    # 해독 결과 업데이트 (로컬용과 동일한 로직)
                                     decode_result = decode_results[track_id]
                                     tracked_qr['text'] = decode_result['text']
                                     tracked_qr['success'] = True
-                                    tracked_qr['method'] = f"YOLO+{decode_result.get('decode_method', 'Unknown')}"
+                                    # 실제 사용된 방법으로 업데이트 (YOLO + 해독 방법)
+                                    decode_method = decode_result.get('decode_method', 'Unknown')
+                                    tracked_qr['method'] = f"YOLO+{decode_method}"
                                     if 'detection' in tracked_qr and decode_result.get('quad_xy'):
-                                        tracked_qr['detection']['quad_xy'] = decode_result['quad_xy']
+                                        # quad_xy를 현재 추적 위치에 맞춰서 변환 (로컬용과 동일)
+                                        current_bbox = tracked_qr.get('bbox', tracked_qr.get('detection', {}).get('bbox_xyxy'))
+                                        decode_bbox = decode_result.get('decode_bbox')
+                                        
+                                        if current_bbox is not None and len(current_bbox) == 4 and \
+                                           decode_bbox is not None and len(decode_bbox) == 4:
+                                            # 해독 시점의 bbox와 현재 추적 bbox의 차이 계산
+                                            decode_x1, decode_y1, decode_x2, decode_y2 = decode_bbox
+                                            curr_x1, curr_y1, curr_x2, curr_y2 = map(int, current_bbox)
+                                            
+                                            # 중심점 이동량 계산
+                                            decode_cx = (decode_x1 + decode_x2) / 2
+                                            decode_cy = (decode_y1 + decode_y2) / 2
+                                            curr_cx = (curr_x1 + curr_x2) / 2
+                                            curr_cy = (curr_y1 + curr_y2) / 2
+                                            
+                                            dx = curr_cx - decode_cx
+                                            dy = curr_cy - decode_cy
+                                            
+                                            # quad_xy를 현재 추적 위치에 맞춰서 이동
+                                            quad_xy_original = decode_result['quad_xy']
+                                            quad_xy_transformed = []
+                                            for qx, qy in quad_xy_original:
+                                                quad_xy_transformed.append([int(qx + dx), int(qy + dy)])
+                                            tracked_qr['detection']['quad_xy'] = quad_xy_transformed
+                                        else:
+                                            # bbox 정보가 없으면 원본 quad_xy 사용
+                                            tracked_qr['detection']['quad_xy'] = decode_result['quad_xy']
                                     continue
                             
                             bbox = tracked_qr.get('bbox', tracked_qr.get('detection', {}).get('bbox_xyxy'))
@@ -860,6 +890,50 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                     detection = qr.get('detection')
                     if detection is None:
                         continue
+                    
+                    # 해독 결과 확인 및 업데이트 (시각화 전에 다시 확인 - 로컬용과 동일)
+                    track_id = qr.get('track_id')
+                    if track_id is not None and decode_results is not None:
+                        with decode_lock:
+                            if track_id in decode_results:
+                                decode_result = decode_results[track_id]
+                                # 해독 결과로 텍스트와 방법 업데이트
+                                if decode_result.get('text'):
+                                    qr['text'] = decode_result['text']
+                                    qr['success'] = True
+                                    # 실제 사용된 방법으로 업데이트 (YOLO + 해독 방법)
+                                    decode_method = decode_result.get('decode_method', 'Unknown')
+                                    qr['method'] = f"YOLO+{decode_method}"
+                                
+                                if 'detection' in qr and decode_result.get('quad_xy'):
+                                    # quad_xy를 현재 추적 위치에 맞춰서 변환
+                                    current_bbox = qr.get('bbox', qr.get('detection', {}).get('bbox_xyxy'))
+                                    decode_bbox = decode_result.get('decode_bbox')
+                                    
+                                    if current_bbox is not None and len(current_bbox) == 4 and \
+                                       decode_bbox is not None and len(decode_bbox) == 4:
+                                        # 해독 시점의 bbox와 현재 추적 bbox의 차이 계산
+                                        decode_x1, decode_y1, decode_x2, decode_y2 = decode_bbox
+                                        curr_x1, curr_y1, curr_x2, curr_y2 = map(int, current_bbox)
+                                        
+                                        # 중심점 이동량 계산
+                                        decode_cx = (decode_x1 + decode_x2) / 2
+                                        decode_cy = (decode_y1 + decode_y2) / 2
+                                        curr_cx = (curr_x1 + curr_x2) / 2
+                                        curr_cy = (curr_y1 + curr_y2) / 2
+                                        
+                                        dx = curr_cx - decode_cx
+                                        dy = curr_cy - decode_cy
+                                        
+                                        # quad_xy를 현재 추적 위치에 맞춰서 이동
+                                        quad_xy_original = decode_result['quad_xy']
+                                        quad_xy_transformed = []
+                                        for qx, qy in quad_xy_original:
+                                            quad_xy_transformed.append([int(qx + dx), int(qy + dy)])
+                                        qr['detection']['quad_xy'] = quad_xy_transformed
+                                    else:
+                                        # bbox 정보가 없으면 원본 quad_xy 사용
+                                        qr['detection']['quad_xy'] = decode_result['quad_xy']
                     
                     qr_points = None
                     if 'quad_xy' in detection and detection['quad_xy'] is not None:
@@ -894,6 +968,31 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                 
                 if tracked_qrs:
                     detected_count += 1
+                
+                # ★★★★★ 프레임별 상세 로그 출력 (verbose_log가 True일 때만) ★★★★★
+                if verbose_log:
+                    log_print(f"\n📹 프레임 {frame_count}/{total_frames}")
+                    if tracked_qrs:
+                        log_print(f"  🔍 탐지: {len(tracked_qrs)}개 QR 코드 발견")
+                        for idx, qr in enumerate(tracked_qrs):
+                            track_id = qr.get('track_id', 'N/A')
+                            bbox = qr.get('bbox', qr.get('detection', {}).get('bbox_xyxy', []))
+                            conf = qr.get('confidence', 0.0)
+                            text = qr.get('text', '')
+                            method = qr.get('method', 'Unknown')
+                            success = qr.get('success', False)
+                            
+                            if len(bbox) == 4:
+                                x1, y1, x2, y2 = bbox
+                                bbox_str = f"bbox=({x1}, {y1}, {x2}, {y2})"
+                            else:
+                                bbox_str = "bbox=N/A"
+                            
+                            status = "✅ 성공" if success else "❌ 실패"
+                            log_print(f"    QR[{idx}] T{track_id}: {status} | {bbox_str} | conf={conf:.3f} | method={method}")
+                            if text:
+                                text_short = text[:50] + "..." if len(text) > 50 else text
+                                log_print(f"      텍스트: {text_short}")
                 
                 # 비디오 저장
                 out_video.write(result_frame)
