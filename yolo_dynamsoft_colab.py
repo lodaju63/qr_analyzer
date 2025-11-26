@@ -568,12 +568,21 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     log_file = open(log_file_path, 'w', encoding='utf-8')
     log_file_closed = False
     
-    def log_print(message):
+    log_buffer = []  # 로그 버퍼링 (성능 개선)
+    log_flush_count = 0
+    
+    def log_print(message, force_flush=False):
         print(message)
         try:
             if not log_file_closed and not log_file.closed:
-                log_file.write(message + '\n')
-                log_file.flush()
+                log_buffer.append(message + '\n')
+                log_flush_count += 1
+                # 10개마다 또는 강제 플러시 시 파일에 쓰기
+                if force_flush or log_flush_count >= 10:
+                    log_file.writelines(log_buffer)
+                    log_file.flush()
+                    log_buffer.clear()
+                    log_flush_count = 0
         except (ValueError, AttributeError):
             # 파일이 닫혔거나 오류 발생 시 콘솔에만 출력
             pass
@@ -590,7 +599,16 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
             model_path = 'model1.pt'
             if os.path.exists(model_path):
                 yolo_model = YOLO(model_path)
-                log_print("✅ YOLO 모델 초기화 완료")
+                
+                # GPU 사용 여부 확인
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                if device == 'cuda':
+                    gpu_name = torch.cuda.get_device_name(0)
+                    log_print(f"✅ YOLO 모델 초기화 완료 (GPU: {gpu_name})")
+                else:
+                    log_print("✅ YOLO 모델 초기화 완료 (CPU 모드)")
+                    log_print("⚠️ GPU를 사용하려면: 런타임 > 런타임 유형 변경 > GPU 선택")
             else:
                 log_print(f"⚠️ YOLO 모델 파일을 찾을 수 없습니다: {model_path}")
                 use_yolo_mode = False
@@ -997,18 +1015,23 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                 # 비디오 저장
                 out_video.write(result_frame)
                 
-                # 코랩에서 프리뷰 표시 (일정 간격마다)
+                # 코랩에서 프리뷰 표시 (일정 간격마다) - 최적화: 메모리 정리 추가
                 if show_preview and frame_count % preview_interval == 0:
-                    clear_output(wait=True)
-                    display_frame = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(display_frame)
-                    plt.axis('off')
-                    plt.title(f'Frame {frame_count}/{total_frames} - Detected: {len(tracked_qrs)} QR codes', 
-                             fontsize=14)
-                    plt.tight_layout()
-                    plt.show()
-                    print(f"프레임 {frame_count}/{total_frames} 처리 중... (탐지: {len(tracked_qrs)}개)")
+                    try:
+                        clear_output(wait=True)
+                        display_frame = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
+                        plt.figure(figsize=(12, 8))
+                        plt.imshow(display_frame)
+                        plt.axis('off')
+                        plt.title(f'Frame {frame_count}/{total_frames} - Detected: {len(tracked_qrs)} QR codes', 
+                                 fontsize=14)
+                        plt.tight_layout()
+                        plt.show()
+                        plt.close()  # 메모리 정리 (성능 개선)
+                        print(f"프레임 {frame_count}/{total_frames} 처리 중... (탐지: {len(tracked_qrs)}개)")
+                    except Exception as e:
+                        # 프리뷰 표시 실패해도 계속 진행
+                        pass
             
             # 진행 상황 출력
             if frame_count % 100 == 0:
@@ -1035,15 +1058,24 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     total_end_time = time.time()
     total_execution_time = total_end_time - total_start_time
     
-    log_print(f"\n📊 결과 통계!")
-    log_print(f"  총 프레임: {total_frames}")
-    log_print(f"  처리된 프레임: {frame_count}")
-    log_print(f"  총 실행 시간: {total_execution_time:.1f}초")
-    log_print(f"  탐지된 프레임: {detected_count}개")
-    log_print(f"  ✅ 성공: {success_count}개")
-    log_print(f"  ❌ 실패: {failed_count}개")
-    log_print(f"  결과 저장: {output_run_dir}/")
-    log_print(f"  📹 출력 영상: {output_video_path}")
+    log_print(f"\n📊 결과 통계!", force_flush=True)
+    log_print(f"  총 프레임: {total_frames}", force_flush=True)
+    log_print(f"  처리된 프레임: {frame_count}", force_flush=True)
+    log_print(f"  총 실행 시간: {total_execution_time:.1f}초", force_flush=True)
+    log_print(f"  탐지된 프레임: {detected_count}개", force_flush=True)
+    log_print(f"  ✅ 성공: {success_count}개", force_flush=True)
+    log_print(f"  ❌ 실패: {failed_count}개", force_flush=True)
+    log_print(f"  결과 저장: {output_run_dir}/", force_flush=True)
+    log_print(f"  📹 출력 영상: {output_video_path}", force_flush=True)
+    
+    # 버퍼에 남은 로그 모두 쓰기
+    try:
+        if not log_file_closed and not log_file.closed and log_buffer:
+            log_file.writelines(log_buffer)
+            log_file.flush()
+            log_buffer.clear()
+    except:
+        pass
     
     # 이제 파일 닫기
     try:
