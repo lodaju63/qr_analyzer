@@ -572,6 +572,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     log_flush_count = 0
     
     def log_print(message, force_flush=False):
+        nonlocal log_buffer, log_flush_count  # 외부 변수 수정을 위해 nonlocal 선언
         print(message)
         try:
             if not log_file_closed and not log_file.closed:
