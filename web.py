@@ -172,6 +172,8 @@ if 'video_writer' not in st.session_state:
     st.session_state.video_writer = None
 if 'temp_video_path' not in st.session_state:
     st.session_state.temp_video_path = None
+if 'temp_video_bytes' not in st.session_state:
+    st.session_state.temp_video_bytes = None  # 메모리에 비디오 바이트 저장
 if 'temp_log_path' not in st.session_state:
     st.session_state.temp_log_path = None
 if 'processing_completed' not in st.session_state:
@@ -194,6 +196,18 @@ if 'stop_decode_worker' not in st.session_state:
     st.session_state.stop_decode_worker = None
 if 'qr_tracker' not in st.session_state:
     st.session_state.qr_tracker = None
+if 'batch_files' not in st.session_state:
+    st.session_state.batch_files = []
+if 'batch_processing' not in st.session_state:
+    st.session_state.batch_processing = False
+if 'batch_results' not in st.session_state:
+    st.session_state.batch_results = {}
+if 'current_batch_file_index' not in st.session_state:
+    st.session_state.current_batch_file_index = 0
+if 'batch_frames' not in st.session_state:
+    st.session_state.batch_frames = {}  # 각 파일의 처리 결과 프레임 저장
+if 'viewing_batch_file_index' not in st.session_state:
+    st.session_state.viewing_batch_file_index = 0  # 현재 보고 있는 파일 인덱스
 
 # 결과 디렉토리 설정
 OUTPUT_BASE_DIR = "output_results"
@@ -346,10 +360,10 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
             else:
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
             
-            if decoded_text:
-                text_to_show = f"#{i} {decoded_text[:30]}"
-                cv2.putText(display_frame, text_to_show, (x1, y1 - 10),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # QR 번호만 표시 (해독정보는 표에 표시됨)
+            track_id_text = f"#{i}"
+            cv2.putText(display_frame, track_id_text, (x1, y1 - 10),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             detected_qrs.append({
                 'track_id': i,
@@ -827,13 +841,11 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                         color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
                         cv2.polylines(display_frame, [points], True, color, 2)
                         
-                        text = qr.get('text', '')
+                        # QR 번호만 표시 (해독정보는 표에 표시됨)
                         track_id = qr.get('track_id')
                         if track_id is not None:
-                            text = f"#{track_id} {text[:30]}"
-                        
-                        if text:
-                            cv2.putText(display_frame, text, 
+                            track_id_text = f"#{track_id}"
+                            cv2.putText(display_frame, track_id_text, 
                                       (int(points[0][0]), int(points[0][1]) - 10),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 elif 'bbox_xyxy' in detection:
@@ -846,13 +858,11 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                     color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
                     
-                    text = qr.get('text', '')
+                    # QR 번호만 표시 (해독정보는 표에 표시됨)
                     track_id = qr.get('track_id')
                     if track_id is not None:
-                        text = f"#{track_id} {text[:30]}"
-                    
-                    if text:
-                        cv2.putText(display_frame, text, (x1, y1 - 10),
+                        track_id_text = f"#{track_id}"
+                        cv2.putText(display_frame, track_id_text, (x1, y1 - 10),
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             # FPS 계산
@@ -950,6 +960,14 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
         # 파일이 존재하는 경우에만 경로 저장
         if os.path.exists(output_video_path) and os.path.getsize(output_video_path) > 0:
             session_state_ref['temp_video_path'] = output_video_path
+            # 메모리에 비디오 바이트도 저장 (파일 없이 재생 가능)
+            try:
+                with open(output_video_path, "rb") as f:
+                    video_bytes = f.read()
+                    session_state_ref['temp_video_bytes'] = video_bytes
+            except Exception as e:
+                # 바이트 읽기 실패해도 경로는 저장되어 있으므로 계속 진행
+                pass
         
         # 누적된 QR 기록을 CSV로 저장
         accumulated_records = session_state_ref.get('accumulated_qr_records', [])
@@ -999,6 +1017,187 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
         session_state_ref['error'] = error_msg
         print(f"ERROR in video thread: {error_msg}")  # 콘솔에도 출력
 
+def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_threshold,
+                              use_preprocessing, use_clahe, use_normalize, clahe_clip_limit,
+                              detect_both_frames, session_state_ref):
+    """여러 파일을 순차적으로 처리하는 스레드"""
+    try:
+        total_files = len(files_info)
+        session_state_ref['batch_processing'] = True
+        session_state_ref['current_batch_file_index'] = 0
+        session_state_ref['batch_results'] = {}
+        session_state_ref['batch_files'] = [f['name'] for f in files_info]
+        session_state_ref['batch_frames'] = {}  # 배치 프레임 초기화
+        session_state_ref['viewing_batch_file_index'] = 0  # 보기 인덱스 초기화
+        
+        for idx, file_info in enumerate(files_info):
+            if session_state_ref.get('should_stop', False):
+                break
+            
+            file_path = file_info['path']
+            file_name = file_info['name']
+            file_ext = file_info['ext']
+            is_image = file_info['is_image']
+            
+            session_state_ref['current_batch_file_index'] = idx
+            session_state_ref['batch_results'][file_name] = {
+                'status': 'processing',
+                'error': None,
+                'video_path': None,
+                'csv_path': None
+            }
+            
+            try:
+                if is_image:
+                    # 이미지 처리
+                    display_frame, detected_qrs, error = process_image_file(
+                        file_path, conf_threshold, iou_threshold,
+                        use_preprocessing, use_clahe, use_normalize,
+                        clahe_clip_limit, detect_both_frames
+                    )
+                    
+                    if error:
+                        session_state_ref['batch_results'][file_name]['status'] = 'error'
+                        session_state_ref['batch_results'][file_name]['error'] = error
+                    else:
+                        # 이미지 결과 저장 및 프레임 저장
+                        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        output_image_path = os.path.join(output_dir, f"{os.path.splitext(file_name)[0]}_{run_id}.jpg")
+                        if display_frame is not None:
+                            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(output_image_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                            session_state_ref['batch_results'][file_name]['image_path'] = output_image_path
+                            
+                            # 이미지는 완료 후에만 배치 프레임에 저장 (처리 속도가 빠르므로)
+                            # 배치 처리 프레임 저장 (화면 표시용)
+                            if 'batch_frames' not in session_state_ref:
+                                session_state_ref['batch_frames'] = {}
+                            session_state_ref['batch_frames'][file_name] = {
+                                'frame': frame_rgb.copy(),  # 복사본 저장
+                                'detected_qrs': detected_qrs,
+                                'frame_num': 1,
+                                'total_frames': 1
+                            }
+                        
+                        # CSV 저장
+                        if detected_qrs:
+                            decoded_qrs = [qr for qr in detected_qrs if qr.get('success')]
+                            if decoded_qrs:
+                                import csv
+                                csv_path = os.path.join(output_dir, f"qr_records_{os.path.splitext(file_name)[0]}_{run_id}.csv")
+                                with open(csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                                    fieldnames = ['프레임', 'QR번호', '해독정보', '신뢰도']
+                                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                                    writer.writeheader()
+                                    for qr in decoded_qrs:
+                                        confidence = qr.get('confidence')
+                                        confidence_str = f"{confidence:.3f}" if isinstance(confidence, (int, float)) else 'N/A'
+                                        writer.writerow({
+                                            '프레임': 1,
+                                            'QR번호': qr.get('track_id', 'N/A'),
+                                            '해독정보': qr.get('text', ''),
+                                            '신뢰도': confidence_str
+                                        })
+                                session_state_ref['batch_results'][file_name]['csv_path'] = csv_path
+                        
+                        session_state_ref['batch_results'][file_name]['status'] = 'completed'
+                else:
+                    # 비디오 처리 - 별도 스레드로 실행하고 실시간 프레임 업데이트
+                    video_output_dir = os.path.join(output_dir, os.path.splitext(file_name)[0])
+                    os.makedirs(video_output_dir, exist_ok=True)
+                    
+                    # 비디오 처리용 임시 session_state 생성
+                    video_session_state = {
+                        'processing': True,
+                        'paused': False,
+                        'should_stop': False,
+                        'yolo_model': session_state_ref.get('yolo_model'),
+                        'dbr_reader': session_state_ref.get('dbr_reader'),
+                        'decode_queue': None,
+                        'decode_results': {},
+                        'decode_lock': threading.Lock(),
+                        'accumulated_qr_records': [],
+                        'qr_tracker': None
+                    }
+                    
+                    # 배치 프레임 초기화
+                    if 'batch_frames' not in session_state_ref:
+                        session_state_ref['batch_frames'] = {}
+                    
+                    # 비디오 처리 스레드 시작
+                    video_thread = threading.Thread(
+                        target=process_video_thread,
+                        args=(file_path, video_output_dir, conf_threshold, iou_threshold,
+                             use_preprocessing, use_clahe, use_normalize,
+                             clahe_clip_limit, detect_both_frames, video_session_state),
+                        daemon=True
+                    )
+                    add_script_run_ctx(video_thread)
+                    video_thread.start()
+                    
+                    # 비디오 처리 중 실시간 프레임 업데이트
+                    while video_thread.is_alive():
+                        # 비디오 세션의 현재 프레임을 배치 프레임에 업데이트
+                        current_video_frame = video_session_state.get('current_frame')
+                        current_video_results = video_session_state.get('current_results', {})
+                        
+                        if current_video_frame is not None:
+                            # 배치 프레임에 실시간 업데이트
+                            session_state_ref['batch_frames'][file_name] = {
+                                'frame': current_video_frame.copy() if isinstance(current_video_frame, np.ndarray) else current_video_frame,
+                                'detected_qrs': current_video_results.get('detected_qrs', []),
+                                'frame_num': current_video_results.get('frame_num', 0),
+                                'total_frames': current_video_results.get('total_frames', 0)
+                            }
+                            # 메인 세션의 current_frame도 업데이트하여 실시간 표시
+                            session_state_ref['current_frame'] = current_video_frame.copy() if isinstance(current_video_frame, np.ndarray) else current_video_frame
+                            session_state_ref['current_results'] = current_video_results
+                        
+                        time.sleep(0.1)  # 0.1초마다 프레임 업데이트 확인
+                    
+                    # 비디오 처리 완료 대기
+                    video_thread.join()
+                    
+                    # 결과 확인
+                    if video_session_state.get('temp_video_path'):
+                        session_state_ref['batch_results'][file_name]['video_path'] = video_session_state['temp_video_path']
+                    if video_session_state.get('temp_qr_records_path'):
+                        session_state_ref['batch_results'][file_name]['csv_path'] = video_session_state['temp_qr_records_path']
+                    
+                    if video_session_state.get('error'):
+                        session_state_ref['batch_results'][file_name]['status'] = 'error'
+                        session_state_ref['batch_results'][file_name]['error'] = video_session_state['error']
+                    else:
+                        session_state_ref['batch_results'][file_name]['status'] = 'completed'
+                        
+                        # 비디오 처리 결과 프레임 최종 저장 (마지막 프레임)
+                        last_frame = video_session_state.get('current_frame')
+                        last_results = video_session_state.get('current_results', {})
+                        if last_frame is not None:
+                            session_state_ref['batch_frames'][file_name] = {
+                                'frame': last_frame.copy() if isinstance(last_frame, np.ndarray) else last_frame,
+                                'detected_qrs': last_results.get('detected_qrs', []),
+                                'frame_num': last_results.get('frame_num', 0),
+                                'total_frames': last_results.get('total_frames', 0)
+                            }
+                        
+            except Exception as e:
+                import traceback
+                error_msg = f"파일 처리 중 오류: {str(e)}\n{traceback.format_exc()}"
+                session_state_ref['batch_results'][file_name]['status'] = 'error'
+                session_state_ref['batch_results'][file_name]['error'] = error_msg
+        
+        session_state_ref['batch_processing'] = False
+        session_state_ref['processing'] = False
+        session_state_ref['processing_completed'] = True
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"배치 처리 중 오류 발생: {e}\n{traceback.format_exc()}"
+        session_state_ref['batch_processing'] = False
+        session_state_ref['processing'] = False
+        session_state_ref['error'] = error_msg
+
 def main():
     st.title("📱 QR 코드 탐지 시스템")
     st.markdown("---")
@@ -1044,11 +1243,46 @@ def main():
         st.markdown("---")
         st.header("📁 파일 업로드")
         
-        uploaded_file = st.file_uploader(
-            "비디오 또는 이미지 파일을 선택하세요",
-            type=['mp4', 'avi', 'mov', 'jpg', 'jpeg', 'png'],
-            help="비디오 파일 또는 이미지 파일을 업로드하세요"
+        # 업로드 모드 선택
+        upload_mode = st.radio(
+            "업로드 모드",
+            ["단일 파일", "여러 파일 (배치 처리)"],
+            horizontal=True,
+            help="단일 파일 또는 여러 파일을 한번에 처리할 수 있습니다."
         )
+        
+        if upload_mode == "단일 파일":
+            uploaded_files = st.file_uploader(
+                "비디오 또는 이미지 파일을 선택하세요",
+                type=['mp4', 'avi', 'mov', 'jpg', 'jpeg', 'png'],
+                help="비디오 파일 또는 이미지 파일을 업로드하세요",
+                accept_multiple_files=False
+            )
+            # 단일 파일 모드에서는 리스트로 변환
+            if uploaded_files:
+                uploaded_files = [uploaded_files]
+            else:
+                uploaded_files = []
+        else:
+            uploaded_files = st.file_uploader(
+                "비디오 또는 이미지 파일을 선택하세요 (여러 개 선택 가능)",
+                type=['mp4', 'avi', 'mov', 'jpg', 'jpeg', 'png'],
+                help="여러 파일을 선택하여 배치 처리할 수 있습니다. Ctrl+클릭 또는 Shift+클릭으로 여러 파일 선택",
+                accept_multiple_files=True
+            )
+            if uploaded_files is None:
+                uploaded_files = []
+        
+        # 업로드된 파일 목록 표시
+        if uploaded_files:
+            st.info(f"📎 {len(uploaded_files)}개 파일이 선택되었습니다:")
+            for i, file in enumerate(uploaded_files, 1):
+                file_ext = os.path.splitext(file.name)[1].lower()
+                file_type = "🖼️ 이미지" if file_ext in ['.jpg', '.jpeg', '.png'] else "🎬 비디오"
+                st.text(f"  {i}. {file_type} - {file.name}")
+        
+        # 단일 파일 모드 호환성을 위해 uploaded_file 변수 유지
+        uploaded_file = uploaded_files[0] if len(uploaded_files) == 1 else None
         
         st.markdown("---")
         
@@ -1075,26 +1309,163 @@ def main():
         with col_header1:
             st.header("📺 처리 화면")
         with col_header2:
-            current_results = st.session_state.current_results
-            if current_results:
-                frame_num = current_results.get('frame_num', 0)
-                total_frames = current_results.get('total_frames', 0)
-                st.metric("현재 프레임", f"{frame_num}/{total_frames}", delta=None)
+            # 배치 처리 중일 때는 배치 결과에서 정보 가져오기
+            if st.session_state.get('batch_processing', False) or len(st.session_state.get('batch_frames', {})) > 0:
+                batch_frames = st.session_state.get('batch_frames', {})
+                batch_files = st.session_state.get('batch_files', [])
+                viewing_idx = st.session_state.get('viewing_batch_file_index', 0)
+                available_files = [f for f in batch_files if f in batch_frames]
+                if available_files and viewing_idx < len(available_files):
+                    current_file_name = available_files[viewing_idx]
+                    frame_data = batch_frames[current_file_name]
+                    frame_num = frame_data.get('frame_num', 0)
+                    total_frames = frame_data.get('total_frames', 0)
+                    st.metric("현재 프레임", f"{frame_num}/{total_frames}", delta=None)
+                else:
+                    st.metric("현재 프레임", "0/0", delta=None)
             else:
-                st.metric("현재 프레임", "0/0", delta=None)
+                current_results = st.session_state.current_results
+                if current_results:
+                    frame_num = current_results.get('frame_num', 0)
+                    total_frames = current_results.get('total_frames', 0)
+                    st.metric("현재 프레임", f"{frame_num}/{total_frames}", delta=None)
+                else:
+                    st.metric("현재 프레임", "0/0", delta=None)
         with col_header3:
-            if current_results:
-                fps = current_results.get('fps', 0.0)
-                st.metric("FPS", f"{fps:.2f}", delta=None)
+            # 배치 처리 중일 때는 배치 결과에서 정보 가져오기
+            if st.session_state.get('batch_processing', False) or len(st.session_state.get('batch_frames', {})) > 0:
+                st.metric("FPS", "0.00", delta=None)  # 배치 처리 중에는 FPS 표시 안함
             else:
-                st.metric("FPS", "0.00", delta=None)
+                current_results = st.session_state.current_results
+                if current_results:
+                    fps = current_results.get('fps', 0.0)
+                    st.metric("FPS", f"{fps:.2f}", delta=None)
+                else:
+                    st.metric("FPS", "0.00", delta=None)
         
         video_placeholder = st.empty()
         
-        # 현재 결과 표시 (app.py 방식: 이미 RGB로 저장된 프레임 사용)
-        current_frame = st.session_state.get('current_frame')
+        # 배치 처리 중일 때는 배치 프레임 표시
+        current_frame = None  # 초기화
+        batch_frames = st.session_state.get('batch_frames', {})
+        is_batch_mode = st.session_state.get('batch_processing', False) or len(batch_frames) > 0
         
-        if current_frame is not None:
+        if is_batch_mode:
+            batch_files = st.session_state.get('batch_files', [])
+            viewing_idx = st.session_state.get('viewing_batch_file_index', 0)
+            
+            if batch_files and len(batch_frames) > 0:
+                # 현재 보고 있는 파일의 프레임 표시
+                available_files = [f for f in batch_files if f in batch_frames]
+                if available_files:
+                    # viewing_idx가 범위를 벗어나지 않도록 조정
+                    if viewing_idx >= len(available_files):
+                        viewing_idx = len(available_files) - 1
+                    if viewing_idx < 0:
+                        viewing_idx = 0
+                    
+                    # 배치 처리 중일 때는 현재 처리 중인 파일을 자동으로 표시
+                    if st.session_state.get('batch_processing', False):
+                        current_processing_idx = st.session_state.get('current_batch_file_index', 0)
+                        if current_processing_idx < len(batch_files):
+                            processing_file = batch_files[current_processing_idx]
+                            if processing_file in available_files:
+                                # 현재 처리 중인 파일로 자동 이동
+                                viewing_idx = available_files.index(processing_file)
+                                st.session_state.viewing_batch_file_index = viewing_idx
+                            # 현재 처리 중인 파일이 아직 프레임이 없으면 메인 current_frame 확인 (영상 처리 중일 수 있음)
+                            elif processing_file not in available_files:
+                                # 영상 처리 중일 수 있으므로 메인 current_frame 확인
+                                main_current_frame = st.session_state.get('current_frame')
+                                if main_current_frame is not None and isinstance(main_current_frame, np.ndarray):
+                                    # 메인 current_frame을 배치 프레임에 추가하여 표시
+                                    session_state_ref = st.session_state
+                                    if 'batch_frames' not in session_state_ref:
+                                        session_state_ref['batch_frames'] = {}
+                                    session_state_ref['batch_frames'][processing_file] = {
+                                        'frame': main_current_frame.copy(),
+                                        'detected_qrs': st.session_state.get('current_results', {}).get('detected_qrs', []),
+                                        'frame_num': st.session_state.get('current_results', {}).get('frame_num', 0),
+                                        'total_frames': st.session_state.get('current_results', {}).get('total_frames', 0)
+                                    }
+                                    # available_files 다시 계산
+                                    available_files = [f for f in batch_files if f in session_state_ref.get('batch_frames', {})]
+                                    if processing_file in available_files:
+                                        viewing_idx = available_files.index(processing_file)
+                                        st.session_state.viewing_batch_file_index = viewing_idx
+                    
+                    current_file_name = available_files[viewing_idx]
+                    frame_data = batch_frames[current_file_name]
+                    current_frame = frame_data.get('frame')
+                    current_results = {
+                        'detected_qrs': frame_data.get('detected_qrs', []),
+                        'frame_num': frame_data.get('frame_num', 0),
+                        'total_frames': frame_data.get('total_frames', 0),
+                        'fps': 0.0
+                    }
+                    
+                    # 파일 탐색 버튼
+                    col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 2, 1, 1])
+                    with col_nav1:
+                        if st.button("◀️ 이전", disabled=viewing_idx == 0, key="prev_batch_file"):
+                            st.session_state.viewing_batch_file_index = max(0, viewing_idx - 1)
+                            st.rerun()
+                    with col_nav2:
+                        st.markdown(f"<div style='text-align: center; padding-top: 10px;'><b>{current_file_name}</b><br>({viewing_idx + 1}/{len(available_files)})</div>", unsafe_allow_html=True)
+                    with col_nav3:
+                        if st.button("다음 ▶️", disabled=viewing_idx >= len(available_files) - 1, key="next_batch_file"):
+                            st.session_state.viewing_batch_file_index = min(len(available_files) - 1, viewing_idx + 1)
+                            st.rerun()
+                    with col_nav4:
+                        # 현재 처리 중인 파일로 이동
+                        current_processing_idx = st.session_state.get('current_batch_file_index', 0)
+                        if st.button("현재 처리 중", key="goto_current_batch_file"):
+                            # 현재 처리 중인 파일이 프레임이 있으면 해당 인덱스로 이동
+                            if current_processing_idx < len(batch_files):
+                                processing_file = batch_files[current_processing_idx]
+                                if processing_file in available_files:
+                                    st.session_state.viewing_batch_file_index = available_files.index(processing_file)
+                                    st.rerun()
+                    
+                    # 배치 처리 프레임 표시
+                    if isinstance(current_frame, np.ndarray):
+                        h, w = current_frame.shape[:2]
+                        max_height = 500
+                        if h > max_height:
+                            scale = max_height / h
+                            new_width = int(w * scale)
+                            new_height = int(h * scale)
+                            current_frame_resized = cv2.resize(current_frame, (new_width, new_height))
+                        else:
+                            current_frame_resized = current_frame
+                        
+                        try:
+                            video_placeholder.image(current_frame_resized, channels="RGB", width='stretch')
+                        except Exception as img_error:
+                            error_str = str(img_error)
+                            if 'MediaFileStorageError' not in error_str and 'MediaFileHandler' not in error_str:
+                                pass
+                    
+                    # 배치 처리 결과 표시를 위해 current_results 업데이트
+                    st.session_state.current_results = current_results
+                else:
+                    # available_files가 비어있지만 batch_frames가 있는 경우 (처리 중)
+                    if len(batch_frames) > 0:
+                        video_placeholder.info("🔄 처리 중... 첫 번째 파일의 결과를 준비하고 있습니다.")
+                    else:
+                        video_placeholder.info("처리 완료된 파일이 없습니다.")
+            else:
+                # batch_files가 없거나 batch_frames가 없는 경우
+                if st.session_state.get('batch_processing', False):
+                    video_placeholder.info("🔄 배치 처리 중... 파일을 처리하고 있습니다.")
+                else:
+                    video_placeholder.info("처리 중인 파일이 없습니다.")
+        else:
+            # 단일 파일 처리 모드
+            current_frame = st.session_state.get('current_frame')
+        
+        # 단일 파일 처리 모드일 때만 프레임 표시
+        if current_frame is not None and not is_batch_mode:
             try:
                 if isinstance(current_frame, np.ndarray):
                     # 이미지를 최대 높이로 제한하여 한 화면에 들어오도록 조정
@@ -1136,8 +1507,10 @@ def main():
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         
         with col_btn1:
-            if st.button("▶️ 처리 시작", disabled=st.session_state.processing, width='stretch'):
-                if uploaded_file is None:
+            is_batch_mode = len(uploaded_files) > 1
+            button_label = "▶️ 배치 처리 시작" if is_batch_mode else "▶️ 처리 시작"
+            if st.button(button_label, disabled=st.session_state.processing or st.session_state.batch_processing, width='stretch'):
+                if not uploaded_files or len(uploaded_files) == 0:
                     st.warning("⚠️ 먼저 파일을 업로드하세요.")
                 elif st.session_state.yolo_model is None:
                     st.warning("⚠️ 먼저 모델을 초기화하세요.")
@@ -1147,57 +1520,96 @@ def main():
                     st.session_state.paused = False
                     st.session_state.should_stop = False
                     
-                    # 임시 디렉토리 생성 (자동 저장 제거 - 사용자가 원할 때만 저장)
+                    # 임시 디렉토리 생성
                     import tempfile
                     temp_dir = tempfile.mkdtemp(prefix="qr_temp_")
                     st.session_state.output_dir = temp_dir
                     st.session_state.temp_dir = temp_dir
                     
-                    # 임시 파일 저장
-                    temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-                    with open(temp_file_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    
-                    # 이미지 파일인지 비디오 파일인지 확인
-                    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-                    is_image = file_ext in ['.jpg', '.jpeg', '.png']
-                    
-                    if is_image:
-                        # 이미지 처리
-                        display_frame, detected_qrs, error = process_image_file(
-                            temp_file_path, conf_threshold, iou_threshold,
-                            use_preprocessing, use_clahe, use_normalize,
-                            clahe_clip_limit, detect_both_frames
-                        )
-                        if error:
-                            st.error(f"이미지 처리 오류: {error}")
-                            st.session_state.processing = False
-                        else:
-                            st.session_state.current_frame = display_frame
-                            st.session_state.current_results = {
-                                'detected_qrs': detected_qrs,
-                                'frame_num': 1,
-                                'total_frames': 1,
-                                'fps': 0.0
-                            }
-                            st.session_state.processing = False
-                            st.success("✅ 이미지 처리 완료!")
-                    else:
-                        # 비디오 처리 스레드 시작 - session_state 참조 전달
-                        processing_thread = threading.Thread(
-                            target=process_video_thread,
-                            args=(temp_file_path, temp_dir, conf_threshold, iou_threshold,
-                                 use_preprocessing, use_clahe, use_normalize, 
+                    if is_batch_mode:
+                        # 배치 처리 모드
+                        files_info = []
+                        for uploaded_file in uploaded_files:
+                            temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+                            with open(temp_file_path, "wb") as f:
+                                f.write(uploaded_file.getbuffer())
+                            
+                            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+                            is_image = file_ext in ['.jpg', '.jpeg', '.png']
+                            
+                            files_info.append({
+                                'name': uploaded_file.name,
+                                'path': temp_file_path,
+                                'ext': file_ext,
+                                'is_image': is_image
+                            })
+                        
+                        # 배치 처리 스레드 시작
+                        batch_thread = threading.Thread(
+                            target=process_batch_files_thread,
+                            args=(files_info, temp_dir, conf_threshold, iou_threshold,
+                                 use_preprocessing, use_clahe, use_normalize,
                                  clahe_clip_limit, detect_both_frames, st.session_state),
                             daemon=True
                         )
-                        # ★★★ [핵심 수정] 스레드에 Streamlit 컨텍스트 주입
-                        add_script_run_ctx(processing_thread)
-                        processing_thread.start()
-                        st.session_state.processing_thread = processing_thread
-                        st.success("✅ 처리 시작!")
-                        time.sleep(0.1)  # 스레드 시작 대기
-                        st.rerun()  # 즉시 화면 갱신하여 처리 화면 표시
+                        add_script_run_ctx(batch_thread)
+                        batch_thread.start()
+                        st.session_state.processing_thread = batch_thread
+                        st.success(f"✅ {len(uploaded_files)}개 파일 배치 처리 시작!")
+                        st.rerun()
+                    else:
+                        # 단일 파일 처리 모드
+                        uploaded_file = uploaded_files[0]
+                        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+                        with open(temp_file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        
+                        # 이미지 파일인지 비디오 파일인지 확인
+                        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+                        is_image = file_ext in ['.jpg', '.jpeg', '.png']
+                        
+                        if is_image:
+                            # 이미지 처리
+                            display_frame, detected_qrs, error = process_image_file(
+                                temp_file_path, conf_threshold, iou_threshold,
+                                use_preprocessing, use_clahe, use_normalize,
+                                clahe_clip_limit, detect_both_frames
+                            )
+                            if error:
+                                st.error(f"이미지 처리 오류: {error}")
+                                st.session_state.processing = False
+                            else:
+                                # BGR을 RGB로 변환 (Streamlit image는 RGB를 기대함)
+                                if display_frame is not None:
+                                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                                    st.session_state.current_frame = frame_rgb.copy()
+                                else:
+                                    st.session_state.current_frame = None
+                                st.session_state.current_results = {
+                                    'detected_qrs': detected_qrs,
+                                    'frame_num': 1,
+                                    'total_frames': 1,
+                                    'fps': 0.0
+                                }
+                                st.session_state.processing = False
+                                st.success("✅ 이미지 처리 완료!")
+                                st.rerun()  # 화면 갱신
+                        else:
+                            # 비디오 처리 스레드 시작 - session_state 참조 전달
+                            processing_thread = threading.Thread(
+                                target=process_video_thread,
+                                args=(temp_file_path, temp_dir, conf_threshold, iou_threshold,
+                                     use_preprocessing, use_clahe, use_normalize, 
+                                     clahe_clip_limit, detect_both_frames, st.session_state),
+                                daemon=True
+                            )
+                            # ★★★ [핵심 수정] 스레드에 Streamlit 컨텍스트 주입
+                            add_script_run_ctx(processing_thread)
+                            processing_thread.start()
+                            st.session_state.processing_thread = processing_thread
+                            st.success("✅ 처리 시작!")
+                            time.sleep(0.1)  # 스레드 시작 대기
+                            st.rerun()  # 즉시 화면 갱신하여 처리 화면 표시
         
         with col_btn2:
             pause_button_label = "⏸️ 일시정지" if not st.session_state.paused else "▶️ 재개"
@@ -1211,7 +1623,42 @@ def main():
                 st.warning("⏹️ 처리 종료 중... (종료 시점까지의 결과를 다운로드할 수 있습니다)")
         
         # 처리 상태
-        if st.session_state.processing:
+        batch_results = st.session_state.get('batch_results', {})
+        has_batch_results = len(batch_results) > 0
+        
+        if st.session_state.batch_processing or (has_batch_results and st.session_state.get('processing_completed', False)):
+            # 배치 처리 중이거나 완료된 경우
+            current_idx = st.session_state.get('current_batch_file_index', 0)
+            total_files = len(st.session_state.get('batch_files', []))
+            if total_files == 0:
+                total_files = len([f for f in batch_results.keys()])
+            
+            completed = len([r for r in batch_results.values() if r.get('status') == 'completed'])
+            errors = len([r for r in batch_results.values() if r.get('status') == 'error'])
+            
+            if st.session_state.batch_processing:
+                # 배치 처리 중
+                st.progress((completed + errors) / total_files if total_files > 0 else 0)
+                st.info(f"🔄 배치 처리 중... ({completed + errors}/{total_files} 완료, {errors}개 오류)")
+            else:
+                # 배치 처리 완료
+                st.progress(1.0)  # 100% 완료
+                st.success(f"✅ 배치 처리 완료! ({completed}/{total_files} 성공, {errors}개 오류)")
+            
+            # 배치 처리 결과 미리보기
+            if batch_results:
+                with st.expander("📋 배치 처리 진행 상황", expanded=True):
+                    for file_name, result in batch_results.items():
+                        status = result.get('status', 'pending')
+                        if status == 'completed':
+                            st.success(f"✅ {file_name}")
+                        elif status == 'error':
+                            st.error(f"❌ {file_name}: {result.get('error', '알 수 없는 오류')[:50]}")
+                        elif status == 'processing':
+                            st.info(f"🔄 {file_name} (처리 중...)")
+                        else:
+                            st.text(f"⏳ {file_name} (대기 중...)")
+        elif st.session_state.processing:
             if st.session_state.paused:
                 st.info("⏸️ 일시정지 중...")
             else:
@@ -1220,7 +1667,27 @@ def main():
     
     with col_qr:
         st.header("📊 해독된 QR 정보")
-        current_results = st.session_state.current_results
+        
+        # 배치 처리 중일 때는 현재 보고 있는 파일의 결과 표시
+        if st.session_state.get('batch_processing', False) or len(st.session_state.get('batch_frames', {})) > 0:
+            batch_frames = st.session_state.get('batch_frames', {})
+            batch_files = st.session_state.get('batch_files', [])
+            viewing_idx = st.session_state.get('viewing_batch_file_index', 0)
+            available_files = [f for f in batch_files if f in batch_frames]
+            
+            if available_files and viewing_idx < len(available_files):
+                current_file_name = available_files[viewing_idx]
+                frame_data = batch_frames[current_file_name]
+                current_results = {
+                    'detected_qrs': frame_data.get('detected_qrs', []),
+                    'frame_num': frame_data.get('frame_num', 0),
+                    'total_frames': frame_data.get('total_frames', 0)
+                }
+            else:
+                current_results = None
+        else:
+            current_results = st.session_state.current_results
+        
         if current_results and current_results.get('detected_qrs'):
             detected_qrs = current_results['detected_qrs']
             decoded_qrs = [qr for qr in detected_qrs if qr.get('success')]
@@ -1273,26 +1740,171 @@ def main():
             st.info("처리 결과가 없습니다.")
         
         # 처리 완료 후 현재 결과 다운로드 섹션
-        if st.session_state.get('processing_completed', False) and not st.session_state.processing:
+        batch_results = st.session_state.get('batch_results', {})
+        is_batch_completed = (st.session_state.get('processing_completed', False) and 
+                             not st.session_state.processing and 
+                             not st.session_state.batch_processing and 
+                             len(batch_results) > 0)
+        
+        if is_batch_completed:
+            # 배치 처리 완료
+            st.markdown("---")
+            completed_count = len([r for r in batch_results.values() if r.get('status') == 'completed'])
+            error_count = len([r for r in batch_results.values() if r.get('status') == 'error'])
+            st.success(f"✅ 배치 처리 완료! ({completed_count}개 성공, {error_count}개 오류)")
+            
+            # 배치 처리 결과 다운로드
+            st.subheader("📦 배치 처리 결과 다운로드")
+            
+            # 모든 결과 파일 수집
+            all_files = []
+            for file_name, result in batch_results.items():
+                if result.get('status') == 'completed':
+                    if result.get('video_path') and os.path.exists(result['video_path']):
+                        all_files.append(('video', result['video_path'], file_name))
+                    if result.get('image_path') and os.path.exists(result['image_path']):
+                        all_files.append(('image', result['image_path'], file_name))
+                    if result.get('csv_path') and os.path.exists(result['csv_path']):
+                        all_files.append(('csv', result['csv_path'], file_name))
+            
+            if all_files:
+                # ZIP으로 전체 다운로드
+                def create_batch_zip():
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                        for file_type, file_path, original_name in all_files:
+                            if os.path.exists(file_path):
+                                base_name = os.path.splitext(original_name)[0]
+                                ext = os.path.splitext(file_path)[1]
+                                zip_name = f"{base_name}{ext}"
+                                zip_file.write(file_path, zip_name)
+                    zip_buffer.seek(0)
+                    return zip_buffer.getvalue()
+                
+                zip_data = create_batch_zip()
+                st.download_button(
+                    label=f"📦 전체 결과 다운로드 ({len(all_files)}개 파일)",
+                    data=zip_data,
+                    file_name=f"batch_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    width='stretch'
+                )
+                
+                # 개별 파일 다운로드
+                st.subheader("📥 개별 파일 다운로드")
+                for file_name, result in batch_results.items():
+                    if result.get('status') == 'completed':
+                        with st.expander(f"📁 {file_name}", expanded=False):
+                            if result.get('video_path') and os.path.exists(result['video_path']):
+                                with open(result['video_path'], "rb") as f:
+                                    st.download_button(
+                                        label="⬇️ 영상 다운로드",
+                                        data=f.read(),
+                                        file_name=os.path.basename(result['video_path']),
+                                        mime="video/mp4",
+                                        key=f"batch_video_{file_name}"
+                                    )
+                            if result.get('image_path') and os.path.exists(result['image_path']):
+                                with open(result['image_path'], "rb") as f:
+                                    st.download_button(
+                                        label="⬇️ 이미지 다운로드",
+                                        data=f.read(),
+                                        file_name=os.path.basename(result['image_path']),
+                                        mime="image/jpeg",
+                                        key=f"batch_image_{file_name}"
+                                    )
+                            if result.get('csv_path') and os.path.exists(result['csv_path']):
+                                with open(result['csv_path'], "rb") as f:
+                                    st.download_button(
+                                        label="⬇️ QR 기록 다운로드 (CSV)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(result['csv_path']),
+                                        mime="text/csv",
+                                        key=f"batch_csv_{file_name}"
+                                    )
+                
+                # output_results에 저장하기 버튼
+                st.markdown("---")
+                if st.button("💾 output_results에 저장하기", width='stretch', type="primary"):
+                    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_dir = os.path.join(OUTPUT_BASE_DIR, f"batch_{run_id}")
+                    os.makedirs(output_dir, exist_ok=True)
+                    
+                    saved_files = []
+                    for file_type, file_path, original_name in all_files:
+                        if os.path.exists(file_path):
+                            dest_path = os.path.join(output_dir, os.path.basename(file_path))
+                            shutil.copy2(file_path, dest_path)
+                            saved_files.append(dest_path)
+                    
+                    if saved_files:
+                        st.success(f"✅ {len(saved_files)}개 파일이 저장되었습니다: {output_dir}")
+                        st.session_state.processing_completed = False
+                        st.session_state.batch_results = {}
+        
+        elif st.session_state.get('processing_completed', False) and not st.session_state.processing:
+            # 단일 파일 처리 완료
             st.markdown("---")
             st.success("✅ 처리 완료! 결과를 다운로드하거나 저장할 수 있습니다.")
             
             temp_video_path = st.session_state.get('temp_video_path')
             temp_qr_records_path = st.session_state.get('temp_qr_records_path')
             
+            # 비디오 파일이 있으면 재생 기능 제공 (메모리에서 직접 재생)
+            temp_video_bytes = st.session_state.get('temp_video_bytes')
+            if temp_video_bytes:
+                st.subheader("🎬 처리된 영상 재생")
+                try:
+                    # 메모리에 저장된 비디오 바이트를 직접 재생 (파일 불필요)
+                    st.video(temp_video_bytes, format="video/mp4")
+                except Exception as e:
+                    st.error(f"비디오 재생 중 오류 발생: {e}")
+                    # 메모리 재생 실패 시 파일에서 읽기 시도
+                    if temp_video_path and os.path.exists(temp_video_path):
+                        try:
+                            with open(temp_video_path, "rb") as video_file:
+                                video_bytes = video_file.read()
+                                st.video(video_bytes, format="video/mp4")
+                        except:
+                            st.info("비디오 파일은 다운로드할 수 있습니다.")
+            elif temp_video_path and os.path.exists(temp_video_path):
+                # 메모리에 없으면 파일에서 읽기 (fallback)
+                st.subheader("🎬 처리된 영상 재생")
+                try:
+                    with open(temp_video_path, "rb") as video_file:
+                        video_bytes = video_file.read()
+                        st.video(video_bytes, format="video/mp4")
+                        # 다음을 위해 메모리에 저장
+                        st.session_state.temp_video_bytes = video_bytes
+                except Exception as e:
+                    st.error(f"비디오 재생 중 오류 발생: {e}")
+                    st.info("비디오 파일은 다운로드할 수 있습니다.")
+            
             col_save1, col_save2 = st.columns(2)
             
             with col_save1:
-                if temp_video_path and os.path.exists(temp_video_path):
-                    st.subheader("📹 처리된 영상")
+                # 다운로드는 메모리 바이트 또는 파일에서
+                video_data = None
+                video_filename = "processed_video.mp4"
+                
+                if temp_video_bytes:
+                    # 메모리에 있으면 메모리에서 다운로드 (파일 불필요)
+                    video_data = temp_video_bytes
+                elif temp_video_path and os.path.exists(temp_video_path):
+                    # 파일에서 읽기
                     with open(temp_video_path, "rb") as f:
-                        st.download_button(
-                            label="⬇️ 영상 다운로드",
-                            data=f.read(),
-                            file_name=os.path.basename(temp_video_path),
-                            mime="video/mp4",
-                            width='stretch'
-                        )
+                        video_data = f.read()
+                        video_filename = os.path.basename(temp_video_path)
+                
+                if video_data:
+                    st.subheader("📹 영상 다운로드")
+                    st.download_button(
+                        label="⬇️ 영상 다운로드",
+                        data=video_data,
+                        file_name=video_filename,
+                        mime="video/mp4",
+                        width='stretch'
+                    )
             
             with col_save2:
                 if temp_qr_records_path and os.path.exists(temp_qr_records_path):
@@ -1477,21 +2089,34 @@ def main():
     else:
         st.info("결과 디렉토리가 없습니다.")
     
-    # 실시간 업데이트 (프로세싱 중일 때)
-    if st.session_state.processing:
-        # 처리 중일 때 주기적으로 화면 업데이트
-        # 첫 프레임이 생성될 때까지 더 빠르게 갱신
-        current_results = st.session_state.get('current_results', {})
-        frame_num = current_results.get('frame_num', 0)
-        current_frame = st.session_state.get('current_frame')
-        
-        if frame_num == 0:
-            # 아직 프레임이 생성되지 않음 - 빠르게 갱신
-            time.sleep(0.05)  # 더 빠르게
+    # 실시간 업데이트 (프로세싱 중일 때만)
+    # 배치 처리 완료 후에는 갱신하지 않음 (완료 메시지 표시를 위해)
+    is_batch_completed = (st.session_state.get('processing_completed', False) and 
+                         not st.session_state.processing and 
+                         not st.session_state.batch_processing and
+                         len(st.session_state.get('batch_results', {})) > 0)
+    
+    if st.session_state.processing or st.session_state.batch_processing:
+        # 처리 중일 때만 주기적으로 화면 업데이트
+        if st.session_state.batch_processing:
+            # 배치 처리 중일 때는 더 빠르게 갱신하여 프레임 표시
+            time.sleep(0.2)  # 프레임이 저장되면 빠르게 표시
         else:
-            # 프레임이 생성됨 - 적절한 속도로 갱신
-            time.sleep(0.15)  # 프레임 속도에 맞춤
+            # 단일 파일 처리 중일 때
+            current_results = st.session_state.get('current_results', {})
+            frame_num = current_results.get('frame_num', 0)
+            current_frame = st.session_state.get('current_frame')
+            
+            if frame_num == 0:
+                # 아직 프레임이 생성되지 않음 - 빠르게 갱신
+                time.sleep(0.05)  # 더 빠르게
+            else:
+                # 프레임이 생성됨 - 적절한 속도로 갱신
+                time.sleep(0.15)  # 프레임 속도에 맞춤
         
+        st.rerun()
+    elif is_batch_completed:
+        # 배치 처리 완료 직후 한 번만 갱신하여 완료 메시지 표시
         st.rerun()
 
 if __name__ == "__main__":

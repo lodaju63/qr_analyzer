@@ -660,7 +660,11 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                     error = license.LicenseManager.init_license(license_key)
                     if error[0] != 0:
                         log_print(f"⚠️ Dynamsoft 라이선스 초기화 실패: {error[1]}")
+                        log_print(f"   라이선스 오류 코드: {error[0]}")
+                        log_print(f"   다른 PC에서 실행 시 라이선스 제한이 있을 수 있습니다.")
+                        log_print(f"   환경 변수 DYNAMSOFT_LICENSE_KEY에 유효한 라이선스 키를 설정하세요.")
                     else:
+                        log_print(f"✅ Dynamsoft 라이선스 초기화 성공")
                         dbr_reader = cvr.CaptureVisionRouter()
                         from dynamsoft_barcode_reader_bundle import EnumPresetTemplate
                         error_code, error_msg, settings = dbr_reader.get_simplified_settings(EnumPresetTemplate.PT_DEFAULT)
@@ -668,12 +672,26 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                             barcode_settings = settings.barcode_settings
                             if barcode_settings:
                                 barcode_settings.barcode_format_ids = dbr.EnumBarcodeFormat.BF_QR_CODE
+                                # 한 번에 많이 찾도록 설정 (colab2와 동일)
                                 if hasattr(barcode_settings, 'expected_barcodes_count'):
-                                    barcode_settings.expected_barcodes_count = 10
+                                    barcode_settings.expected_barcodes_count = 50  # 10 -> 50으로 증가
                                 if hasattr(barcode_settings, 'deblur_level'):
-                                    barcode_settings.deblur_level = 9
-                            dbr_reader.update_settings(EnumPresetTemplate.PT_DEFAULT, settings)
-                        log_print("✅ Dynamsoft Barcode Reader 초기화 완료")
+                                    barcode_settings.deblur_level = 9  # 최대 디블러 레벨
+                                # 추가 최적화 설정
+                                if hasattr(barcode_settings, 'min_barcode_text_length'):
+                                    barcode_settings.min_barcode_text_length = 1
+                            # 타임아웃 설정도 추가
+                            if hasattr(settings, 'timeout'):
+                                settings.timeout = 500  # 500ms 타임아웃
+                            # 설정 업데이트 및 확인
+                            update_error = dbr_reader.update_settings(EnumPresetTemplate.PT_DEFAULT, settings)
+                            if update_error[0] != 0:
+                                log_print(f"⚠️ Dynamsoft 설정 업데이트 경고: {update_error[1]}")
+                            else:
+                                log_print(f"✅ Dynamsoft Barcode Reader 초기화 완료 (expected_barcodes_count=50, deblur_level=9)")
+                        else:
+                            log_print(f"⚠️ Dynamsoft 설정 가져오기 실패: error_code={error_code}, msg={error_msg}")
+                            log_print("✅ Dynamsoft Barcode Reader 초기화 완료 (기본 설정 사용)")
         except Exception as e:
             log_print(f"❌ Dynamsoft 초기화 실패: {e}")
             dbr_reader = None
