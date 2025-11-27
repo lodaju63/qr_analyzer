@@ -720,15 +720,16 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     # 실제 프레임 크기와 메타데이터가 다르면 실제 크기 사용
     if actual_width != width_meta or actual_height != height_meta:
-        log_print(f"⚠️ 메타데이터와 실제 프레임 크기가 다릅니다:")
-        log_print(f"   메타데이터: {width_meta}x{height_meta}")
-        log_print(f"   실제 프레임: {actual_width}x{actual_height}")
-        log_print(f"   실제 프레임 크기를 사용합니다.")
+        log_print(f"⚠️ 메타데이터와 실제 프레임 크기가 다릅니다:", force_flush=True)
+        log_print(f"   메타데이터: {width_meta}x{height_meta}", force_flush=True)
+        log_print(f"   실제 프레임: {actual_width}x{actual_height}", force_flush=True)
+        log_print(f"   실제 프레임 크기를 사용합니다.", force_flush=True)
         width = actual_width
         height = actual_height
     else:
         width = width_meta
         height = height_meta
+        log_print(f"✅ 메타데이터와 실제 프레임 크기 일치: {width}x{height}", force_flush=True)
     
     # 프레임 카운트가 0이거나 부정확할 수 있으므로 실제로 카운트
     if total_frames_meta <= 0:
@@ -762,15 +763,17 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         except:
             file_size_mb = "확인 불가"
     
-    log_print(f"\n📹 비디오 정보:")
-    log_print(f"  파일: {video_path}")
-    log_print(f"  파일 크기: {file_size_mb}")
-    log_print(f"  해상도: {width}x{height}")
-    log_print(f"  FPS: {fps:.2f}")
-    log_print(f"  총 프레임: {total_frames}")
-    log_print(f"  OpenCV 버전: {opencv_version}")
-    log_print(f"  비디오 백엔드: {backend}")
-    log_print("", force_flush=True)  # 강제 플러시
+    log_print(f"\n📹 비디오 정보:", force_flush=True)
+    log_print(f"  파일: {video_path}", force_flush=True)
+    log_print(f"  파일 크기: {file_size_mb}", force_flush=True)
+    log_print(f"  해상도 (사용): {width}x{height}", force_flush=True)
+    log_print(f"  해상도 (메타데이터): {width_meta}x{height_meta}", force_flush=True)
+    log_print(f"  해상도 (실제 프레임): {actual_width}x{actual_height}", force_flush=True)
+    log_print(f"  FPS: {fps:.2f}", force_flush=True)
+    log_print(f"  총 프레임 (사용): {total_frames}", force_flush=True)
+    log_print(f"  총 프레임 (메타데이터): {total_frames_meta}", force_flush=True)
+    log_print(f"  OpenCV 버전: {opencv_version}", force_flush=True)
+    log_print(f"  비디오 백엔드: {backend}", force_flush=True)
     
     # 출력 비디오 설정
     output_video_path = os.path.join(output_run_dir, f"output_{run_id}.mp4")
