@@ -702,16 +702,63 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         log_print(f"❌ 비디오 파일을 열 수 없습니다: {video_path}")
         return
     
+    # 첫 프레임을 읽어서 실제 해상도 확인 (메타데이터가 부정확할 수 있음)
+    ret, first_frame = cap.read()
+    if not ret:
+        log_print(f"❌ 비디오 파일에서 프레임을 읽을 수 없습니다: {video_path}")
+        cap.release()
+        return
+    
+    # 실제 프레임 크기 확인
+    actual_height, actual_width = first_frame.shape[:2]
+    
+    # 메타데이터에서 정보 가져오기
     fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames_meta = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width_meta = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height_meta = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # 실제 프레임 크기와 메타데이터가 다르면 실제 크기 사용
+    if actual_width != width_meta or actual_height != height_meta:
+        log_print(f"⚠️ 메타데이터와 실제 프레임 크기가 다릅니다:")
+        log_print(f"   메타데이터: {width_meta}x{height_meta}")
+        log_print(f"   실제 프레임: {actual_width}x{actual_height}")
+        log_print(f"   실제 프레임 크기를 사용합니다.")
+        width = actual_width
+        height = actual_height
+    else:
+        width = width_meta
+        height = height_meta
+    
+    # 프레임 카운트가 0이거나 부정확할 수 있으므로 실제로 카운트
+    if total_frames_meta <= 0:
+        log_print(f"⚠️ 메타데이터에서 프레임 수를 가져올 수 없습니다. 실제로 카운트합니다...")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_count = 0
+        while True:
+            ret, _ = cap.read()
+            if not ret:
+                break
+            frame_count += 1
+        total_frames = frame_count
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 처음으로 되돌리기
+    else:
+        total_frames = total_frames_meta
+        # 첫 프레임을 읽었으므로 다시 처음으로 돌아가기
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    # OpenCV 버전 및 백엔드 정보 (디버깅용)
+    opencv_version = cv2.__version__
+    backend = cap.getBackendName() if hasattr(cap, 'getBackendName') else "Unknown"
     
     log_print(f"\n📹 비디오 정보:")
     log_print(f"  파일: {video_path}")
+    log_print(f"  파일 크기: {os.path.getsize(video_path) / (1024*1024):.2f} MB" if os.path.exists(video_path) else "  파일 크기: 확인 불가")
     log_print(f"  해상도: {width}x{height}")
     log_print(f"  FPS: {fps:.2f}")
     log_print(f"  총 프레임: {total_frames}")
+    log_print(f"  OpenCV 버전: {opencv_version}")
+    log_print(f"  비디오 백엔드: {backend}")
     
     # 출력 비디오 설정
     output_video_path = os.path.join(output_run_dir, f"output_{run_id}.mp4")
