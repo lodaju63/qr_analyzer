@@ -757,15 +757,18 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     # 파일 크기 확인
     file_size_mb = "확인 불가"
+    file_size_bytes = 0
     if os.path.exists(video_path):
         try:
-            file_size_mb = f"{os.path.getsize(video_path) / (1024*1024):.2f} MB"
+            file_size_bytes = os.path.getsize(video_path)
+            file_size_mb = f"{file_size_bytes / (1024*1024):.2f} MB"
         except:
             file_size_mb = "확인 불가"
     
     log_print(f"\n📹 비디오 정보:", force_flush=True)
     log_print(f"  파일: {video_path}", force_flush=True)
-    log_print(f"  파일 크기: {file_size_mb}", force_flush=True)
+    log_print(f"  파일명: {os.path.basename(video_path)}", force_flush=True)
+    log_print(f"  파일 크기: {file_size_mb} ({file_size_bytes:,} bytes)", force_flush=True)
     log_print(f"  해상도 (사용): {width}x{height}", force_flush=True)
     log_print(f"  해상도 (메타데이터): {width_meta}x{height_meta}", force_flush=True)
     log_print(f"  해상도 (실제 프레임): {actual_width}x{actual_height}", force_flush=True)
