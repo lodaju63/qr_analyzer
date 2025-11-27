@@ -749,16 +749,28 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     # OpenCV 버전 및 백엔드 정보 (디버깅용)
     opencv_version = cv2.__version__
-    backend = cap.getBackendName() if hasattr(cap, 'getBackendName') else "Unknown"
+    try:
+        backend = cap.getBackendName()
+    except:
+        backend = "Unknown"
+    
+    # 파일 크기 확인
+    file_size_mb = "확인 불가"
+    if os.path.exists(video_path):
+        try:
+            file_size_mb = f"{os.path.getsize(video_path) / (1024*1024):.2f} MB"
+        except:
+            file_size_mb = "확인 불가"
     
     log_print(f"\n📹 비디오 정보:")
     log_print(f"  파일: {video_path}")
-    log_print(f"  파일 크기: {os.path.getsize(video_path) / (1024*1024):.2f} MB" if os.path.exists(video_path) else "  파일 크기: 확인 불가")
+    log_print(f"  파일 크기: {file_size_mb}")
     log_print(f"  해상도: {width}x{height}")
     log_print(f"  FPS: {fps:.2f}")
     log_print(f"  총 프레임: {total_frames}")
     log_print(f"  OpenCV 버전: {opencv_version}")
     log_print(f"  비디오 백엔드: {backend}")
+    log_print("", force_flush=True)  # 강제 플러시
     
     # 출력 비디오 설정
     output_video_path = os.path.join(output_run_dir, f"output_{run_id}.mp4")
