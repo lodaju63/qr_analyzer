@@ -190,7 +190,7 @@ def initialize_models():
     # YOLO 모델 초기화
     if YOLO_AVAILABLE:
         try:
-            model_path = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
+            model_path = os.environ.get('YOLO_MODEL_PATH', 'best.pt')  # 기본값: best.pt (OBB 모델)
             if os.path.exists(model_path):
                 yolo_model = YOLO(model_path)
                 st.success(f"✅ YOLO 모델 로드 완료: {model_path}")
@@ -231,7 +231,7 @@ def initialize_models():
     return yolo_model, dbr_reader, None
 
 def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocessing,
-                      use_clahe, use_normalize, clahe_clip_limit, detect_both_frames):
+                      use_clahe, clahe_clip_limit, detect_both_frames):
     """이미지 파일 처리"""
     if not YOLO_DYNASOFT_IMPORTED:
         return None, None, "yolo_dynamsoft.py 모듈을 import할 수 없습니다."
@@ -253,7 +253,6 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
             conf_threshold=conf_threshold,
             use_preprocessing=use_preprocessing,
             use_clahe=use_clahe,
-            use_normalize=use_normalize,
             clahe_clip_limit=clahe_clip_limit,
             detect_both_frames=detect_both_frames,
             iou_threshold=iou_threshold
@@ -268,46 +267,144 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
         
         for i, location in enumerate(filtered_locations):
             x1, y1, x2, y2 = location['bbox']
-            roi = frame[y1:y2, x1:x2]
+            roi_original = frame[y1:y2, x1:x2]
             
-            # 해독 시도
+            # 해독 시도 (원본 → CLAHE 처리된 ROI → 반전 이미지 순서로 시도)
             decoded_text = None
             quad_xy = None
+            decode_method_detail = None
             
-            if dbr_reader and roi.size > 0:
+            if dbr_reader and roi_original.size > 0:
                 try:
-                    if len(roi.shape) == 3:
-                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                    else:
-                        roi_gray = roi.copy()
+                    # CLAHE 처리된 ROI 준비 (전처리 옵션이 켜져 있을 때만)
+                    roi_clahe = None
+                    if use_preprocessing and use_clahe:
+                        try:
+                            if len(roi_original.shape) == 3:
+                                roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                            else:
+                                roi_gray = roi_original.copy()
+                            clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+                            roi_clahe_processed = clahe.apply(roi_gray)
+                            roi_clahe = cv2.cvtColor(roi_clahe_processed, cv2.COLOR_GRAY2BGR)
+                        except:
+                            roi_clahe = None
                     
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                    roi_enhanced = clahe.apply(roi_gray)
-                    roi_norm = cv2.normalize(roi_enhanced, None, 0, 255, cv2.NORM_MINMAX)
+                    # 해독 시도할 ROI 목록 (우선순위 순서)
+                    rois_to_try = []
+                    rois_to_try.append(('original', roi_original))
+                    if roi_clahe is not None and roi_clahe.size > 0:
+                        rois_to_try.append(('clahe', roi_clahe))
                     
-                    rh, rw = roi_norm.shape
-                    border_size = 20
-                    white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
-                    white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_norm
-                    roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
-                    
+                    items = None
                     if DBR_VERSION == "bundle_v11":
                         from dynamsoft_barcode_reader_bundle import dbr as dbr_module
-                        captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
-                        barcode_result = captured_result.get_decoded_barcodes_result()
-                        if barcode_result:
-                            items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                        
+                        # 각 ROI로 해독 시도
+                        for roi_type, roi in rois_to_try:
                             if items and len(items) > 0:
-                                barcode_item = items[0]
-                                text = None
-                                if hasattr(barcode_item, 'get_text'):
-                                    text = barcode_item.get_text()
-                                elif hasattr(barcode_item, 'text'):
-                                    text = barcode_item.text
-                                elif hasattr(barcode_item, 'barcode_text'):
-                                    text = barcode_item.barcode_text
-                                if text:
-                                    decoded_text = _process_decoded_text(text)
+                                break  # 이미 해독 성공했으면 중단
+                            
+                            # 전처리 적용 (해독률 향상)
+                            # 1. 그레이스케일 변환
+                            if len(roi.shape) == 3:
+                                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                            else:
+                                roi_gray = roi.copy()
+                            
+                            # 2. CLAHE 적용 (원본 ROI인 경우에만, CLAHE ROI는 이미 처리됨)
+                            if roi_type == 'original':
+                                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                roi_enhanced = clahe.apply(roi_gray)
+                            else:
+                                roi_enhanced = roi_gray  # CLAHE ROI는 이미 처리됨
+                            
+                            # 3. 흰색 테두리 추가 (일반 QR 코드용: 검은색 QR, 밝은 배경)
+                            rh, rw = roi_enhanced.shape
+                            border_size = 20
+                            white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
+                            white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_enhanced
+                            
+                            # 4. RGB로 변환 (Dynamsoft는 RGB를 사용)
+                            roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
+                            
+                            # 해독 시도
+                            captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                            barcode_result = captured_result.get_decoded_barcodes_result()
+                            if barcode_result:
+                                items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                                if items and len(items) > 0:
+                                    if roi_type == 'original':
+                                        decode_method_detail = "원본(흰테두리)"
+                                    else:
+                                        decode_method_detail = "CLAHE처리(흰테두리)"
+                                    break
+                        
+                        # 방법 3: 원본 실패 시, 반전 이미지로 시도 (하얀색 QR 코드용)
+                        if not items or len(items) == 0:
+                            # 원본 ROI로 반전 이미지 생성
+                            if len(roi_original.shape) == 3:
+                                roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                            else:
+                                roi_gray = roi_original.copy()
+                            
+                            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                            roi_enhanced = clahe.apply(roi_gray)
+                            
+                            # 반전 이미지 전처리 (하얀색 QR 코드용)
+                            roi_inverted_gray = cv2.bitwise_not(roi_enhanced)
+                            # 검은색 테두리 추가 (하얀색 QR 코드는 어두운 배경에 밝은 QR)
+                            rh, rw = roi_enhanced.shape
+                            border_size = 20
+                            black_canvas = np.full((rh + border_size*2, rw + border_size*2), 0, dtype=np.uint8)
+                            black_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_inverted_gray
+                            roi_rgb_inverted = cv2.cvtColor(black_canvas, cv2.COLOR_GRAY2RGB)
+                            
+                            captured_result_inverted = dbr_reader.capture(roi_rgb_inverted, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                            barcode_result_inverted = captured_result_inverted.get_decoded_barcodes_result()
+                            if barcode_result_inverted:
+                                items = barcode_result_inverted.get_items() if hasattr(barcode_result_inverted, 'get_items') else None
+                                if items and len(items) > 0:
+                                    decode_method_detail = "반전(검은테두리)"
+                    
+                    if items and len(items) > 0:
+                        barcode_item = items[0]
+                        text = None
+                        if hasattr(barcode_item, 'get_text'):
+                            text = barcode_item.get_text()
+                        elif hasattr(barcode_item, 'text'):
+                            text = barcode_item.text
+                        elif hasattr(barcode_item, 'barcode_text'):
+                            text = barcode_item.barcode_text
+                        
+                        if text:
+                            decoded_text = _process_decoded_text(text)
+                            
+                            # quad_xy 추출
+                            try:
+                                location_obj = None
+                                if hasattr(barcode_item, 'get_location'):
+                                    location_obj = barcode_item.get_location()
+                                elif hasattr(barcode_item, 'location'):
+                                    location_obj = barcode_item.location
+                                
+                                if location_obj:
+                                    result_points = None
+                                    if hasattr(location_obj, 'result_points'):
+                                        result_points = location_obj.result_points
+                                    elif hasattr(location_obj, 'points'):
+                                        result_points = location_obj.points
+                                    elif hasattr(location_obj, 'get_result_points'):
+                                        result_points = location_obj.get_result_points()
+                                    
+                                    if result_points:
+                                        quad_xy = []
+                                        for point in result_points:
+                                            abs_x = x1 + int(point.x)
+                                            abs_y = y1 + int(point.y)
+                                            quad_xy.append([abs_x, abs_y])
+                            except:
+                                pass
                 except:
                     pass
             
@@ -321,7 +418,11 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
                 success = False
                 method = "YOLO"
             
-            if quad_xy and len(quad_xy) == 4:
+            # OBB 모델 좌표 우선 사용, 없으면 quad_xy, 없으면 bbox
+            if location.get('obb_points') and len(location['obb_points']) == 4:
+                obb_points = np.array(location['obb_points'], dtype=np.int32)
+                cv2.polylines(display_frame, [obb_points.reshape((-1, 1, 2))], isClosed=True, color=color, thickness=2)
+            elif quad_xy and len(quad_xy) == 4:
                 quad_array = np.array(quad_xy, dtype=np.int32)
                 cv2.polylines(display_frame, [quad_array], True, color, 2)
             else:
@@ -342,7 +443,8 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
                 'frame': 0,
                 'detection': {
                     'bbox_xyxy': location['bbox'],
-                    'quad_xy': quad_xy
+                    'quad_xy': quad_xy,
+                    'obb_points': location.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
                 }
             })
         
@@ -364,10 +466,22 @@ def decode_worker_func_with_ref(dbr_reader, decode_queue, stop_event, session_st
             if item is None:
                 return
             
+            # 큐 아이템 파싱 (새로운 형식: track_id, roi_original, roi_clahe, bbox, roi_offset)
             if len(item) == 5:
-                track_id, roi, bbox, roi_offset, frame_num = item
+                if isinstance(item[1], np.ndarray) and isinstance(item[2], (np.ndarray, type(None))):
+                    # 새로운 형식: (track_id, roi_original, roi_clahe, bbox, roi_offset)
+                    track_id, roi_original, roi_clahe, bbox, roi_offset = item
+                    frame_num = None
+                else:
+                    # 기존 형식: (track_id, roi, bbox, roi_offset, frame_num)
+                    track_id, roi, bbox, roi_offset, frame_num = item
+                    roi_original = roi
+                    roi_clahe = None
             else:
+                # 기존 형식: (track_id, roi, bbox, roi_offset)
                 track_id, roi, bbox, roi_offset = item
+                roi_original = roi
+                roi_clahe = None
                 frame_num = None
             
             decoded_text = None
@@ -375,85 +489,134 @@ def decode_worker_func_with_ref(dbr_reader, decode_queue, stop_event, session_st
             decode_method_detail = None
             
             try:
+                # Dynamsoft로 해독 시도 (원본 → CLAHE 처리된 ROI → 반전 이미지 순서로 시도)
                 if dbr_reader is not None:
-                    if len(roi.shape) == 3:
-                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                    else:
-                        roi_gray = roi.copy()
-                    
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                    roi_enhanced = clahe.apply(roi_gray)
-                    roi_norm = cv2.normalize(roi_enhanced, None, 0, 255, cv2.NORM_MINMAX)
-                    
-                    rh, rw = roi_norm.shape
-                    border_size = 20
-                    white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
-                    white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_norm
-                    roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
-                    
-                    if DBR_VERSION == "bundle_v11":
-                        from dynamsoft_barcode_reader_bundle import dbr as dbr_module
-                        
+                    try:
                         items = None
-                        captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
-                        barcode_result = captured_result.get_decoded_barcodes_result()
-                        if barcode_result:
-                            items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
-                            if items and len(items) > 0:
-                                decode_method_detail = "원본(흰테두리)"
+                        decode_method_detail = None
                         
-                        if not items or len(items) == 0:
-                            roi_inverted_gray = cv2.bitwise_not(roi_norm)
-                            black_canvas = np.full((rh + border_size*2, rw + border_size*2), 0, dtype=np.uint8)
-                            black_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_inverted_gray
-                            roi_rgb_inverted = cv2.cvtColor(black_canvas, cv2.COLOR_GRAY2RGB)
+                        # 해독 시도할 ROI 목록 (우선순위 순서)
+                        rois_to_try = []
+                        
+                        # 1순위: 원본 ROI
+                        rois_to_try.append(('original', roi_original))
+                        
+                        # 2순위: CLAHE 처리된 ROI (있는 경우)
+                        if roi_clahe is not None and roi_clahe.size > 0:
+                            rois_to_try.append(('clahe', roi_clahe))
+                        
+                        # Bundle v11 API 사용
+                        if DBR_VERSION == "bundle_v11":
+                            from dynamsoft_barcode_reader_bundle import dbr as dbr_module
                             
-                            captured_result_inverted = dbr_reader.capture(roi_rgb_inverted, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
-                            barcode_result_inverted = captured_result_inverted.get_decoded_barcodes_result()
-                            if barcode_result_inverted:
-                                items = barcode_result_inverted.get_items() if hasattr(barcode_result_inverted, 'get_items') else None
+                            # 각 ROI로 해독 시도
+                            for roi_type, roi in rois_to_try:
                                 if items and len(items) > 0:
-                                    decode_method_detail = "반전(정규화후,검은테두리)"
-                        
-                        if items and len(items) > 0:
-                            barcode_item = items[0]
-                            text = None
-                            if hasattr(barcode_item, 'get_text'):
-                                text = barcode_item.get_text()
-                            elif hasattr(barcode_item, 'text'):
-                                text = barcode_item.text
-                            elif hasattr(barcode_item, 'barcode_text'):
-                                text = barcode_item.barcode_text
-                            
-                            if text:
-                                decoded_text = text
-                                decoded_text = _process_decoded_text(decoded_text)
+                                    break  # 이미 해독 성공했으면 중단
                                 
-                                try:
-                                    location = None
-                                    if hasattr(barcode_item, 'get_location'):
-                                        location = barcode_item.get_location()
-                                    elif hasattr(barcode_item, 'location'):
-                                        location = barcode_item.location
+                                # 전처리 적용 (해독률 향상)
+                                # 1. 그레이스케일 변환
+                                if len(roi.shape) == 3:
+                                    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                                else:
+                                    roi_gray = roi.copy()
+                                
+                                # 2. CLAHE 적용 (원본 ROI인 경우에만, CLAHE ROI는 이미 처리됨)
+                                if roi_type == 'original':
+                                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                    roi_enhanced = clahe.apply(roi_gray)
+                                else:
+                                    roi_enhanced = roi_gray  # CLAHE ROI는 이미 처리됨
+                                
+                                # 3. 흰색 테두리 추가 (일반 QR 코드용: 검은색 QR, 밝은 배경)
+                                rh, rw = roi_enhanced.shape
+                                border_size = 20
+                                white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
+                                white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_enhanced
+                                
+                                # 4. RGB로 변환 (Dynamsoft는 RGB를 사용)
+                                roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
+                                
+                                # 해독 시도
+                                captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                                barcode_result = captured_result.get_decoded_barcodes_result()
+                                if barcode_result:
+                                    items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                                    if items and len(items) > 0:
+                                        if roi_type == 'original':
+                                            decode_method_detail = "원본(흰테두리)"
+                                        else:
+                                            decode_method_detail = "CLAHE처리(흰테두리)"
+                                        break
+                            
+                            # 방법 3: 원본 실패 시, 반전 이미지로 시도 (하얀색 QR 코드용)
+                            if not items or len(items) == 0:
+                                # 원본 ROI로 반전 이미지 생성
+                                if len(roi_original.shape) == 3:
+                                    roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                                else:
+                                    roi_gray = roi_original.copy()
+                                
+                                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                roi_enhanced = clahe.apply(roi_gray)
+                                
+                                # 반전 이미지 전처리 (하얀색 QR 코드용)
+                                roi_inverted_gray = cv2.bitwise_not(roi_enhanced)
+                                # 검은색 테두리 추가 (하얀색 QR 코드는 어두운 배경에 밝은 QR)
+                                rh, rw = roi_enhanced.shape
+                                border_size = 20
+                                black_canvas = np.full((rh + border_size*2, rw + border_size*2), 0, dtype=np.uint8)
+                                black_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_inverted_gray
+                                roi_rgb_inverted = cv2.cvtColor(black_canvas, cv2.COLOR_GRAY2RGB)
+                                
+                                captured_result_inverted = dbr_reader.capture(roi_rgb_inverted, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                                barcode_result_inverted = captured_result_inverted.get_decoded_barcodes_result()
+                                if barcode_result_inverted:
+                                    items = barcode_result_inverted.get_items() if hasattr(barcode_result_inverted, 'get_items') else None
+                                    if items and len(items) > 0:
+                                        decode_method_detail = "반전(검은테두리)"
+                    except:
+                        pass
+                    
+                    if items and len(items) > 0:
+                        barcode_item = items[0]
+                        text = None
+                        if hasattr(barcode_item, 'get_text'):
+                            text = barcode_item.get_text()
+                        elif hasattr(barcode_item, 'text'):
+                            text = barcode_item.text
+                        elif hasattr(barcode_item, 'barcode_text'):
+                            text = barcode_item.barcode_text
+                        
+                        if text:
+                            decoded_text = text
+                            decoded_text = _process_decoded_text(decoded_text)
+                            
+                            try:
+                                location = None
+                                if hasattr(barcode_item, 'get_location'):
+                                    location = barcode_item.get_location()
+                                elif hasattr(barcode_item, 'location'):
+                                    location = barcode_item.location
+                                
+                                if location:
+                                    result_points = None
+                                    if hasattr(location, 'result_points'):
+                                        result_points = location.result_points
+                                    elif hasattr(location, 'points'):
+                                        result_points = location.points
+                                    elif hasattr(location, 'get_result_points'):
+                                        result_points = location.get_result_points()
                                     
-                                    if location:
-                                        result_points = None
-                                        if hasattr(location, 'result_points'):
-                                            result_points = location.result_points
-                                        elif hasattr(location, 'points'):
-                                            result_points = location.points
-                                        elif hasattr(location, 'get_result_points'):
-                                            result_points = location.get_result_points()
-                                        
-                                        if result_points:
-                                            roi_x1, roi_y1 = roi_offset
-                                            quad_xy = []
-                                            for point in result_points:
-                                                abs_x = roi_x1 + int(point.x)
-                                                abs_y = roi_y1 + int(point.y)
-                                                quad_xy.append([abs_x, abs_y])
-                                except:
-                                    pass
+                                    if result_points:
+                                        roi_x1, roi_y1 = roi_offset
+                                        quad_xy = []
+                                        for point in result_points:
+                                            abs_x = roi_x1 + int(point.x)
+                                            abs_y = roi_y1 + int(point.y)
+                                            quad_xy.append([abs_x, abs_y])
+                            except:
+                                pass
             except Exception as e:
                 # 에러는 무시 (로그 파일 제거됨)
                 pass
@@ -490,7 +653,7 @@ def decode_worker_func_with_ref(dbr_reader, decode_queue, stop_event, session_st
                 decode_queue.task_done()
 
 def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
-                        use_preprocessing, use_clahe, use_normalize, clahe_clip_limit,
+                        use_preprocessing, use_clahe, clahe_clip_limit,
                         detect_both_frames, session_state_ref):
     """비디오 처리 스레드 - 스레드 안전 버전"""
     # Streamlit 경고 억제 (스레드 내에서)
@@ -644,7 +807,6 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                     conf_threshold=conf_threshold,
                     use_preprocessing=use_preprocessing,
                     use_clahe=use_clahe,
-                    use_normalize=use_normalize,
                     clahe_clip_limit=clahe_clip_limit,
                     detect_both_frames=detect_both_frames,
                     iou_threshold=iou_threshold
@@ -694,11 +856,28 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                             bbox = qr.get('bbox', qr.get('detection', {}).get('bbox_xyxy'))
                             if bbox and len(bbox) == 4:
                                 x1, y1, x2, y2 = map(int, bbox)
-                                roi = frame[y1:y2, x1:x2]
-                                if roi.size > 0:
+                                roi_original = frame[y1:y2, x1:x2]
+                                
+                                # CLAHE 처리된 ROI 준비 (전처리 옵션이 켜져 있을 때만)
+                                roi_clahe = None
+                                if use_preprocessing and use_clahe and roi_original.size > 0:
                                     try:
+                                        # CLAHE 전처리 적용
+                                        if len(roi_original.shape) == 3:
+                                            roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                                        else:
+                                            roi_gray = roi_original.copy()
+                                        clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+                                        roi_clahe_processed = clahe.apply(roi_gray)
+                                        roi_clahe = cv2.cvtColor(roi_clahe_processed, cv2.COLOR_GRAY2BGR)
+                                    except:
+                                        roi_clahe = None
+                                
+                                if roi_original.size > 0:
+                                    try:
+                                        # 원본 ROI와 CLAHE 처리된 ROI 둘 다 전달
                                         decode_queue.put_nowait(
-                                            (track_id, roi, bbox, (x1, y1), frame_count)
+                                            (track_id, roi_original, roi_clahe, bbox, (x1, y1))
                                         )
                                     except:
                                         pass
@@ -790,7 +969,20 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
             
             for qr in detected_qrs:
                 detection = qr.get('detection', {})
-                if 'quad_xy' in detection and detection['quad_xy']:
+                color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
+                points = None
+                
+                # OBB 모델 좌표 우선 사용
+                if 'obb_points' in detection and detection['obb_points'] and len(detection['obb_points']) == 4:
+                    obb_points = np.array(detection['obb_points'], dtype=np.float32)
+                    points = obb_points.copy()
+                    points[:, 0] *= scale_x
+                    points[:, 1] *= scale_y
+                    points = points.astype(np.int32)
+                    cv2.polylines(display_frame, [points.reshape((-1, 1, 2))], isClosed=True, color=color, thickness=2)
+                
+                # quad_xy 사용 (fallback)
+                elif 'quad_xy' in detection and detection['quad_xy']:
                     quad = np.array(detection['quad_xy'])
                     if len(quad) == 4:
                         quad_array = np.array(quad)
@@ -804,32 +996,26 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                         points[:, 0] *= scale_x
                         points[:, 1] *= scale_y
                         points = points.astype(np.int32)
-                        
-                        color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
                         cv2.polylines(display_frame, [points], True, color, 2)
-                        
-                        # QR 번호만 표시 (해독정보는 표에 표시됨)
-                        track_id = qr.get('track_id')
-                        if track_id is not None:
-                            track_id_text = f"#{track_id}"
-                            cv2.putText(display_frame, track_id_text, 
-                                      (int(points[0][0]), int(points[0][1]) - 10),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+                # bbox 사용 (최종 fallback)
                 elif 'bbox_xyxy' in detection:
                     x1, y1, x2, y2 = detection['bbox_xyxy']
                     x1 = int(x1 * scale_x)
                     y1 = int(y1 * scale_y)
                     x2 = int(x2 * scale_x)
                     y2 = int(y2 * scale_y)
-                    
-                    color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    
-                    # QR 번호만 표시 (해독정보는 표에 표시됨)
+                    # bbox의 경우 points를 설정하여 텍스트 표시 위치 결정
+                    points = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+                
+                # QR 번호 표시 (points가 있는 경우)
+                if points is not None and len(points) > 0:
                     track_id = qr.get('track_id')
                     if track_id is not None:
                         track_id_text = f"#{track_id}"
-                        cv2.putText(display_frame, track_id_text, (x1, y1 - 10),
+                        text_pos = (int(points[0][0]), int(points[0][1]) - 10)
+                        cv2.putText(display_frame, track_id_text, text_pos,
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             # FPS 계산
@@ -977,7 +1163,7 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
         print(f"ERROR in video thread: {error_msg}")  # 콘솔에도 출력
 
 def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_threshold,
-                              use_preprocessing, use_clahe, use_normalize, clahe_clip_limit,
+                              use_preprocessing, use_clahe, clahe_clip_limit,
                               detect_both_frames, session_state_ref):
     """여러 파일을 순차적으로 처리하는 스레드"""
     try:
@@ -1009,7 +1195,7 @@ def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_thres
                     # 이미지 처리
                     display_frame, detected_qrs, error = process_image_file(
                         file_path, conf_threshold, iou_threshold,
-                        use_preprocessing, use_clahe, use_normalize,
+                        use_preprocessing, use_clahe,
                         clahe_clip_limit, detect_both_frames
                     )
                     
@@ -1070,7 +1256,7 @@ def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_thres
                     video_thread = threading.Thread(
                         target=process_video_thread,
                         args=(file_path, video_output_dir, conf_threshold, iou_threshold,
-                             use_preprocessing, use_clahe, use_normalize,
+                             use_preprocessing, use_clahe,
                              clahe_clip_limit, detect_both_frames, video_session_state),
                         daemon=True
                     )
@@ -1131,7 +1317,7 @@ def main():
         st.subheader("전처리 옵션")
         
         use_preprocessing = st.checkbox("전처리 사용", value=False,
-                                       help="전처리를 사용하면 CLAHE와 정규화가 적용됩니다.")
+                                       help="전처리를 사용하면 CLAHE가 적용됩니다.")
         
         use_clahe = st.checkbox("CLAHE 적용", value=True, 
                                help="CLAHE (Contrast Limited Adaptive Histogram Equalization)를 사용하여 대비를 개선합니다. 전처리 사용 시 적용됩니다.")
@@ -1145,12 +1331,9 @@ def main():
             st.info("💡 전처리를 활성화하면 CLAHE 설정이 적용됩니다.")
         
         if use_preprocessing:
-            use_normalize = st.checkbox("정규화 적용", value=True,
-                                       help="이미지 정규화를 적용하여 대비를 끌어올립니다.")
             detect_both_frames = st.checkbox("원본과 전처리 프레임 모두 탐지", value=True,
                                             help="원본 프레임과 전처리된 프레임 모두에서 QR 코드를 탐지합니다.")
         else:
-            use_normalize = False
             detect_both_frames = True
         
         st.markdown("---")
@@ -1377,7 +1560,7 @@ def main():
                             batch_thread = threading.Thread(
                                 target=process_batch_files_thread,
                                 args=(files_info, temp_dir, conf_threshold, iou_threshold,
-                                     use_preprocessing, use_clahe, use_normalize,
+                                     use_preprocessing, use_clahe,
                                      clahe_clip_limit, detect_both_frames, st.session_state),
                                 daemon=True
                             )
@@ -1401,7 +1584,7 @@ def main():
                             # 이미지 처리
                             display_frame, detected_qrs, error = process_image_file(
                                 temp_file_path, conf_threshold, iou_threshold,
-                                use_preprocessing, use_clahe, use_normalize,
+                                use_preprocessing, use_clahe,
                                 clahe_clip_limit, detect_both_frames
                             )
                             if error:
@@ -1456,7 +1639,7 @@ def main():
                             processing_thread = threading.Thread(
                                 target=process_video_thread,
                                 args=(temp_file_path, temp_dir, conf_threshold, iou_threshold,
-                                     use_preprocessing, use_clahe, use_normalize, 
+                                     use_preprocessing, use_clahe, 
                                      clahe_clip_limit, detect_both_frames, st.session_state),
                                 daemon=True
                             )

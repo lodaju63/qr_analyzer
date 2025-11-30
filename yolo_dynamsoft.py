@@ -44,7 +44,7 @@ except ImportError:
     print("⚠️ ultralytics를 사용할 수 없습니다. pip install ultralytics로 설치하세요.")
 
 # YOLO 모델 경로 설정 (환경 변수 또는 기본값)
-YOLO_MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')  # 기본값: model1.pt, 다른 모델 테스트 시 환경 변수로 변경 가능
+YOLO_MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'best.pt')  # 기본값: best.pt (OBB 모델), 다른 모델 테스트 시 환경 변수로 변경 가능
 
 # PIL import (한글 폰트 지원용)
 try:
@@ -74,7 +74,7 @@ def _process_decoded_text(decoded_text):
     
     return decoded_text
 
-def preprocess_frame_for_detection(frame, use_clahe=True, use_normalize=True, clahe_clip_limit=2.0):
+def preprocess_frame_for_detection(frame, use_clahe=True, clahe_clip_limit=2.0):
     """
     탐지 성능 향상을 위한 프레임 전처리
     - 대비가 낮은 QR 코드 (검정 QR/검정 배경, 하얀 QR/하얀 배경) 탐지 개선
@@ -82,7 +82,6 @@ def preprocess_frame_for_detection(frame, use_clahe=True, use_normalize=True, cl
     Args:
         frame: 입력 프레임 (BGR)
         use_clahe: CLAHE 적용 여부 (기본: True)
-        use_normalize: 정규화 적용 여부 (기본: True)
         clahe_clip_limit: CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함, 오탐지 감소)
     
     Returns:
@@ -102,21 +101,15 @@ def preprocess_frame_for_detection(frame, use_clahe=True, use_normalize=True, cl
         else:
             enhanced = gray
         
-        # 3. 정규화 (대비 끌어올림)
-        if use_normalize:
-            normalized = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX)
-        else:
-            normalized = enhanced
-        
-        # 4. BGR로 변환 (YOLO는 3채널 입력 필요)
-        processed = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
+        # 3. BGR로 변환 (YOLO는 3채널 입력 필요)
+        processed = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         
         return processed
     except:
         return frame
 
 def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessing=False, 
-                             use_clahe=True, use_normalize=True, clahe_clip_limit=2.0, 
+                             use_clahe=True, clahe_clip_limit=2.0, 
                              detect_both_frames=True, iou_threshold=0.5):
     """YOLO 모델로 QR 코드 위치 빠르게 탐지
     
@@ -126,7 +119,6 @@ def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessin
         conf_threshold: 신뢰도 임계값
         use_preprocessing: 전처리 사용 여부
         use_clahe: CLAHE 적용 여부
-        use_normalize: 정규화 적용 여부
         clahe_clip_limit: CLAHE clipLimit 값
         detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부
         iou_threshold: IoU 임계값 (중복 제거용)
@@ -141,7 +133,6 @@ def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessin
         frames_to_detect = []
         if use_preprocessing:
             processed_frame = preprocess_frame_for_detection(frame, use_clahe=use_clahe, 
-                                                           use_normalize=use_normalize, 
                                                            clahe_clip_limit=clahe_clip_limit)
             if detect_both_frames:
                 frames_to_detect = [processed_frame, frame]
@@ -154,14 +145,77 @@ def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessin
             results = model(detect_frame, conf=conf_threshold, verbose=False)
             result = results[0]
             
-            if result.boxes is not None and len(result.boxes) > 0:
-                h_orig, w_orig = frame.shape[:2]
-                h_detect, w_detect = detect_frame.shape[:2]
-                
-                # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
-                scale_x = w_orig / w_detect if w_detect > 0 else 1.0
-                scale_y = h_orig / h_detect if h_detect > 0 else 1.0
-                
+            h_orig, w_orig = frame.shape[:2]
+            h_detect, w_detect = detect_frame.shape[:2]
+            
+            # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
+            scale_x = w_orig / w_detect if w_detect > 0 else 1.0
+            scale_y = h_orig / h_detect if h_detect > 0 else 1.0
+            
+            # OBB 모델 처리 (우선순위 1)
+            if hasattr(result, 'obb') and result.obb is not None and len(result.obb) > 0:
+                for i in range(len(result.obb)):
+                    try:
+                        conf = float(result.obb.conf[i])
+                        
+                        # OBB의 xyxyxyxy 속성 사용 (4개 점 좌표 - 회전된 박스)
+                        if hasattr(result.obb, 'xyxyxyxy') and result.obb.xyxyxyxy is not None and len(result.obb.xyxyxyxy) > i:
+                            # OBB의 4개 점 좌표 가져오기 (GPU -> CPU -> Numpy)
+                            obb_points = result.obb.xyxyxyxy[i].cpu().numpy().astype(np.int32)
+                            
+                            # 원본 프레임 좌표로 변환
+                            obb_points[:, 0] = (obb_points[:, 0] * scale_x).astype(np.int32)
+                            obb_points[:, 1] = (obb_points[:, 1] * scale_y).astype(np.int32)
+                            
+                            # 경계 체크
+                            obb_points[:, 0] = np.clip(obb_points[:, 0], 0, w_orig)
+                            obb_points[:, 1] = np.clip(obb_points[:, 1], 0, h_orig)
+                            
+                            # axis-aligned 바운딩 박스 계산 (기존 호환성 유지)
+                            x1 = int(np.min(obb_points[:, 0]))
+                            y1 = int(np.min(obb_points[:, 1]))
+                            x2 = int(np.max(obb_points[:, 0]))
+                            y2 = int(np.max(obb_points[:, 1]))
+                            
+                            # 패딩 추가 (QR 코드 경계 확보)
+                            pad = 20
+                            x1 = max(0, x1 - pad)
+                            y1 = max(0, y1 - pad)
+                            x2 = min(w_orig, x2 + pad)
+                            y2 = min(h_orig, y2 + pad)
+                            
+                            all_locations.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': conf,
+                                'obb_points': obb_points.tolist()  # OBB 좌표 저장 (시각화용)
+                            })
+                        # xyxy 속성 사용 (fallback)
+                        elif hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
+                            xyxy = result.obb.xyxy[i].cpu().numpy()
+                            x1, y1, x2, y2 = map(int, xyxy)
+                            
+                            # 원본 프레임 좌표로 변환
+                            x1 = int(x1 * scale_x)
+                            y1 = int(y1 * scale_y)
+                            x2 = int(x2 * scale_x)
+                            y2 = int(y2 * scale_y)
+                            
+                            # 패딩 추가 (QR 코드 경계 확보)
+                            pad = 20
+                            x1 = max(0, x1 - pad)
+                            y1 = max(0, y1 - pad)
+                            x2 = min(w_orig, x2 + pad)
+                            y2 = min(h_orig, y2 + pad)
+                            
+                            all_locations.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': conf
+                            })
+                    except Exception as e:
+                        continue
+            
+            # 일반 detection 모델 처리 (우선순위 2)
+            elif result.boxes is not None and len(result.boxes) > 0:
                 for box in result.boxes:
                     conf = float(box.conf[0])
                     xyxy = box.xyxy[0].cpu().numpy()
@@ -267,7 +321,7 @@ def filter_overlapping_yolo_rois(locations, iou_threshold=0.5):
 # 호출하도록 수정합니다.
 # -----------------------------------------------------------------
 def process_frame_with_yolo(frame, yolo_model, conf_threshold=0.25, use_preprocessing=False,
-                            use_clahe=True, use_normalize=True, clahe_clip_limit=2.0, 
+                            use_clahe=True, clahe_clip_limit=2.0, 
                             detect_both_frames=True, iou_threshold=0.5):
     """YOLO로 빠르게 위치만 탐지 (해독 제거, 비동기 해독으로 분리)
     
@@ -277,7 +331,6 @@ def process_frame_with_yolo(frame, yolo_model, conf_threshold=0.25, use_preproce
         conf_threshold: YOLO 신뢰도 임계값
         use_preprocessing: 전처리 사용 여부
         use_clahe: CLAHE 적용 여부
-        use_normalize: 정규화 적용 여부
         clahe_clip_limit: CLAHE clipLimit 값
         detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부
         iou_threshold: IoU 임계값
@@ -290,7 +343,6 @@ def process_frame_with_yolo(frame, yolo_model, conf_threshold=0.25, use_preproce
         qr_locations = yolo_detect_qr_locations(yolo_model, frame, conf_threshold, 
                                                use_preprocessing=use_preprocessing,
                                                use_clahe=use_clahe,
-                                               use_normalize=use_normalize,
                                                clahe_clip_limit=clahe_clip_limit,
                                                detect_both_frames=detect_both_frames,
                                                iou_threshold=iou_threshold)
@@ -859,7 +911,7 @@ class QRTracker:
 
 
 def video_player_with_qr(video_path, output_dir="video_player_results", 
-                         use_preprocessing=False, use_clahe=True, use_normalize=True,
+                         use_preprocessing=False, use_clahe=True,
                          clahe_clip_limit=2.0, detect_both_frames=True, conf_threshold=0.25,
                          iou_threshold=0.5):
     """영상 플레이어 + 실시간 QR 탐지
@@ -869,7 +921,6 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         output_dir: 출력 디렉토리
         use_preprocessing: 전처리 사용 여부 (기본: False)
         use_clahe: CLAHE 적용 여부 (기본: True)
-        use_normalize: 정규화 적용 여부 (기본: True)
         clahe_clip_limit: CLAHE clipLimit 값 (기본: 2.0)
         detect_both_frames: 원본과 전처리 프레임 모두 탐지 여부 (기본: True)
         conf_threshold: YOLO 신뢰도 임계값 (기본: 0.25)
@@ -1125,62 +1176,105 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                     if item is None:
                         return
                     
+                    # 큐 아이템 파싱 (새로운 형식: track_id, roi_original, roi_clahe, bbox, roi_offset)
                     if len(item) == 5:
-                        track_id, roi, bbox, roi_offset, frame_num = item  # roi_offset: (roi_x1, roi_y1), frame_num: 프레임 번호
+                        if isinstance(item[1], np.ndarray) and isinstance(item[2], (np.ndarray, type(None))):
+                            # 새로운 형식: (track_id, roi_original, roi_clahe, bbox, roi_offset)
+                            track_id, roi_original, roi_clahe, bbox, roi_offset = item
+                            frame_num = None
+                        else:
+                            # 기존 형식: (track_id, roi, bbox, roi_offset, frame_num)
+                            track_id, roi, bbox, roi_offset, frame_num = item
+                            roi_original = roi
+                            roi_clahe = None
                     else:
-                        track_id, roi, bbox, roi_offset = item  # roi_offset: (roi_x1, roi_y1)
-                        frame_num = None  # 프레임 번호가 없으면 None
+                        # 기존 형식: (track_id, roi, bbox, roi_offset)
+                        track_id, roi, bbox, roi_offset = item
+                        roi_original = roi
+                        roi_clahe = None
+                        frame_num = None
                     decoded_text = None
                     quad_xy = None
                     used_dbr = False  # Dynamsoft 사용 여부 추적
                     decode_method_detail = None  # 성공한 방법 상세 정보
                     
                     try:
-                        # Dynamsoft로 해독 시도
+                        # Dynamsoft로 해독 시도 (원본 → CLAHE 처리된 ROI → 반전 이미지 순서로 시도)
                         if dbr_reader is not None:
                             try:
-                                # 전처리 적용 (해독률 향상)
-                                # 1. 그레이스케일 변환
-                                if len(roi.shape) == 3:
-                                    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                                else:
-                                    roi_gray = roi.copy()
+                                items = None
+                                decode_method_detail = None
                                 
-                                # 2. CLAHE 적용 (어두운 환경 대비 개선)
-                                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                                roi_enhanced = clahe.apply(roi_gray)
+                                # 해독 시도할 ROI 목록 (우선순위 순서)
+                                rois_to_try = []
                                 
-                                # 3. 정규화 (대비 끌어올림)
-                                roi_norm = cv2.normalize(roi_enhanced, None, 0, 255, cv2.NORM_MINMAX)
+                                # 1순위: 원본 ROI
+                                rois_to_try.append(('original', roi_original))
                                 
-                                # 4. 흰색 테두리 추가 (일반 QR 코드용: 검은색 QR, 밝은 배경)
-                                rh, rw = roi_norm.shape
-                                border_size = 20
-                                white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
-                                white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_norm
-                                
-                                # 5. RGB로 변환 (Dynamsoft는 RGB를 사용)
-                                roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
+                                # 2순위: CLAHE 처리된 ROI (있는 경우)
+                                if roi_clahe is not None and roi_clahe.size > 0:
+                                    rois_to_try.append(('clahe', roi_clahe))
                                 
                                 # Bundle v11 API 사용
                                 if DBR_VERSION == "bundle_v11":
                                     from dynamsoft_barcode_reader_bundle import dbr as dbr_module
                                     
-                                    items = None
-                                    
-                                    # 방법 1: 원본 이미지로 시도 (일반 QR 코드용)
-                                    captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
-                                    barcode_result = captured_result.get_decoded_barcodes_result()
-                                    if barcode_result:
-                                        items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                                    # 각 ROI로 해독 시도
+                                    for roi_type, roi in rois_to_try:
                                         if items and len(items) > 0:
-                                            decode_method_detail = "원본(흰테두리)"
+                                            break  # 이미 해독 성공했으면 중단
+                                        
+                                        # 전처리 적용 (해독률 향상)
+                                        # 1. 그레이스케일 변환
+                                        if len(roi.shape) == 3:
+                                            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                                        else:
+                                            roi_gray = roi.copy()
+                                        
+                                        # 2. CLAHE 적용 (원본 ROI인 경우에만, CLAHE ROI는 이미 처리됨)
+                                        if roi_type == 'original':
+                                            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                            roi_enhanced = clahe.apply(roi_gray)
+                                        else:
+                                            roi_enhanced = roi_gray  # CLAHE ROI는 이미 처리됨
+                                        
+                                        # 3. 흰색 테두리 추가 (일반 QR 코드용: 검은색 QR, 밝은 배경)
+                                        rh, rw = roi_enhanced.shape
+                                        border_size = 20
+                                        white_canvas = np.full((rh + border_size*2, rw + border_size*2), 255, dtype=np.uint8)
+                                        white_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_enhanced
+                                        
+                                        # 5. RGB로 변환 (Dynamsoft는 RGB를 사용)
+                                        roi_rgb = cv2.cvtColor(white_canvas, cv2.COLOR_GRAY2RGB)
+                                        
+                                        # 해독 시도
+                                        captured_result = dbr_reader.capture(roi_rgb, dbr_module.EnumImagePixelFormat.IPF_RGB_888)
+                                        barcode_result = captured_result.get_decoded_barcodes_result()
+                                        if barcode_result:
+                                            items = barcode_result.get_items() if hasattr(barcode_result, 'get_items') else None
+                                            if items and len(items) > 0:
+                                                if roi_type == 'original':
+                                                    decode_method_detail = "원본(흰테두리)"
+                                                else:
+                                                    decode_method_detail = "CLAHE처리(흰테두리)"
+                                                break
                                     
-                                    # 방법 2: 원본 실패 시, 반전 이미지로 시도 (하얀색 QR 코드용)
+                                    # 방법 3: 원본 실패 시, 반전 이미지로 시도 (하얀색 QR 코드용)
                                     if not items or len(items) == 0:
+                                        # 원본 ROI로 반전 이미지 생성
+                                        if len(roi_original.shape) == 3:
+                                            roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                                        else:
+                                            roi_gray = roi_original.copy()
+                                        
+                                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                        roi_enhanced = clahe.apply(roi_gray)
+                                        
                                         # 반전 이미지 전처리 (하얀색 QR 코드용)
-                                        roi_inverted_gray = cv2.bitwise_not(roi_norm)
+                                        roi_inverted_gray = cv2.bitwise_not(roi_enhanced)
                                         # 검은색 테두리 추가 (하얀색 QR 코드는 어두운 배경에 밝은 QR)
+                                        rh, rw = roi_enhanced.shape
+                                        border_size = 20
                                         black_canvas = np.full((rh + border_size*2, rw + border_size*2), 0, dtype=np.uint8)
                                         black_canvas[border_size:border_size+rh, border_size:border_size+rw] = roi_inverted_gray
                                         roi_rgb_inverted = cv2.cvtColor(black_canvas, cv2.COLOR_GRAY2RGB)
@@ -1190,7 +1284,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                         if barcode_result_inverted:
                                             items = barcode_result_inverted.get_items() if hasattr(barcode_result_inverted, 'get_items') else None
                                             if items and len(items) > 0:
-                                                decode_method_detail = "반전(정규화후,검은테두리)"
+                                                decode_method_detail = "반전(검은테두리)"
                                     
                                     if items and len(items) > 0:
                                         # 첫 번째 바코드 사용
@@ -1329,7 +1423,8 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
         # Dynamsoft 방법별 상세 통계
         dynamsoft_method_stats = {
             "원본(흰테두리)": 0,
-            "반전(정규화후,검은테두리)": 0
+            "CLAHE처리(흰테두리)": 0,
+            "반전(검은테두리)": 0
         }
     else:
         # 비-YOLO 모드는 지원하지 않음
@@ -1452,9 +1547,15 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                         if detection is None:
                             continue
                         
-                        # quad_xy 우선 사용, 없으면 bbox_xyxy 사용
+                        # OBB 모델 좌표 우선 사용, 없으면 quad_xy, 없으면 bbox_xyxy 사용
                         qr_points = None
-                        if 'quad_xy' in detection and detection['quad_xy'] is not None:
+                        if 'obb_points' in detection and detection['obb_points'] is not None:
+                            obb_points = np.array(detection['obb_points'], dtype=np.float32)
+                            if len(obb_points) == 4:
+                                # OBB 좌표를 그대로 사용 (이미 정렬되어 있음)
+                                qr_points = np.array([obb_points], dtype=np.float32)
+                        
+                        if qr_points is None and 'quad_xy' in detection and detection['quad_xy'] is not None:
                             quad = detection['quad_xy']
                             if len(quad) == 4:
                                 quad_array = np.array(quad)
@@ -1501,7 +1602,6 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                                                       conf_threshold=conf_threshold,
                                                                       use_preprocessing=use_preprocessing,
                                                                       use_clahe=use_clahe,
-                                                                      use_normalize=use_normalize,
                                                                       clahe_clip_limit=clahe_clip_limit,
                                                                       detect_both_frames=detect_both_frames,
                                                                       iou_threshold=iou_threshold)
@@ -1516,7 +1616,8 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                 'text': '',  # 아직 해독 안됨
                                 'detection': {
                                     'bbox_xyxy': location['bbox'],
-                                    'quad_xy': None  # 해독 후 업데이트
+                                    'quad_xy': None,  # 해독 후 업데이트
+                                    'obb_points': location.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
                                 },
                                 'method': 'YOLO',
                                 'success': False
@@ -1591,14 +1692,31 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                                     tracked_qr['detection']['quad_xy'] = decode_result['quad_xy']
                                             continue
                                     
-                                    # ROI 추출하여 해독 큐에 추가
+                                    # ROI 추출하여 해독 큐에 추가 (원본 + CLAHE 처리된 ROI 둘 다 준비)
                                     bbox = tracked_qr.get('bbox', tracked_qr.get('detection', {}).get('bbox_xyxy'))
                                     if bbox is not None and len(bbox) == 4:
                                         x1, y1, x2, y2 = map(int, bbox)
-                                        roi = frame[y1:y2, x1:x2]
-                                        if roi.size > 0:
+                                        roi_original = frame[y1:y2, x1:x2]
+                                        
+                                        # CLAHE 처리된 ROI 준비 (전처리 옵션이 켜져 있을 때만)
+                                        roi_clahe = None
+                                        if use_preprocessing and use_clahe and roi_original.size > 0:
                                             try:
-                                                decode_queue.put_nowait((track_id, roi, bbox, (x1, y1)))
+                                                # CLAHE 전처리 적용
+                                                if len(roi_original.shape) == 3:
+                                                    roi_gray = cv2.cvtColor(roi_original, cv2.COLOR_BGR2GRAY)
+                                                else:
+                                                    roi_gray = roi_original.copy()
+                                                clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+                                                roi_clahe_processed = clahe.apply(roi_gray)
+                                                roi_clahe = cv2.cvtColor(roi_clahe_processed, cv2.COLOR_GRAY2BGR)
+                                            except:
+                                                roi_clahe = None
+                                        
+                                        if roi_original.size > 0:
+                                            try:
+                                                # 원본 ROI와 CLAHE 처리된 ROI 둘 다 전달
+                                                decode_queue.put_nowait((track_id, roi_original, roi_clahe, bbox, (x1, y1)))
                                             except:
                                                 # 큐가 가득 차면 스킵
                                                 pass
@@ -1718,8 +1836,15 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                                 # bbox 정보가 없으면 원본 quad_xy 사용
                                                 qr['detection']['quad_xy'] = decode_result['quad_xy']
                             
+                            # OBB 모델 좌표 우선 사용 (회전된 박스 정확히 표시)
+                            if 'obb_points' in detection and detection['obb_points'] is not None:
+                                obb_points = np.array(detection['obb_points'], dtype=np.float32)
+                                if len(obb_points) == 4:
+                                    # OBB 좌표를 그대로 사용 (이미 정렬되어 있음)
+                                    qr_points = np.array([obb_points], dtype=np.float32)
+                            
                             # Dynamsoft 결과 처리 - quad_xy로 정확한 기울어진 형태 사용
-                            if 'quad_xy' in detection and detection['quad_xy'] is not None:
+                            elif 'quad_xy' in detection and detection['quad_xy'] is not None:
                                 # quad_xy 사용 (기울어진 사각형의 4개 꼭짓점)
                                 quad = detection['quad_xy']
                                 if len(quad) == 4:
@@ -2114,9 +2239,8 @@ if __name__ == "__main__":
     parser.add_argument('--iou', type=float, default=0.5, help='겹침 임계값 (기본: 0.5)')
     
     # 전처리 옵션
-    parser.add_argument('--preprocessing', action='store_true', help='전처리 사용 (CLAHE + 정규화)')
+    parser.add_argument('--preprocessing', action='store_true', help='전처리 사용 (CLAHE)')
     parser.add_argument('--no-clahe', action='store_true', help='CLAHE 전처리 사용 안 함')
-    parser.add_argument('--no-normalize', action='store_true', help='정규화 전처리 사용 안 함')
     parser.add_argument('--clahe-clip-limit', type=float, default=2.0, help='CLAHE clipLimit 값 (기본: 2.0, 낮을수록 대비 개선 약함/오탐지 감소)')
     parser.add_argument('--single-frame', action='store_true', help='원본과 전처리 프레임 중 하나만 탐지 (기본: 둘 다 탐지)')
     
@@ -2125,7 +2249,6 @@ if __name__ == "__main__":
     # 전처리 옵션 파싱
     use_preprocessing = args.preprocessing
     use_clahe = not args.no_clahe if use_preprocessing else False
-    use_normalize = not args.no_normalize if use_preprocessing else False
     detect_both_frames = not args.single_frame
     
     video_player_with_qr(
@@ -2133,7 +2256,6 @@ if __name__ == "__main__":
         output_dir=args.output,
         use_preprocessing=use_preprocessing,
         use_clahe=use_clahe,
-        use_normalize=use_normalize,
         clahe_clip_limit=args.clahe_clip_limit,
         detect_both_frames=detect_both_frames,
         conf_threshold=args.conf,
@@ -2145,4 +2267,3 @@ if __name__ == "__main__":
     # --clahe-clip-limit 2.0 clahe 클립 제한
     # --preprocessing 전처리 사용
     # --no-clahe	clahe 사용 안 함
-    # --no-normalize 정규화 사용 안함

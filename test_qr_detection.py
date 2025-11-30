@@ -229,8 +229,39 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5,
                     try:
                         conf = float(result.obb.conf[i])
                         
-                        # OBB의 xyxy 속성 사용 (axis-aligned 바운딩 박스)
-                        if hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
+                        # OBB의 xyxyxyxy 속성 사용 (4개 점 좌표 - 회전된 박스)
+                        if hasattr(result.obb, 'xyxyxyxy') and result.obb.xyxyxyxy is not None and len(result.obb.xyxyxyxy) > i:
+                            # OBB의 4개 점 좌표 가져오기 (GPU -> CPU -> Numpy)
+                            obb_points = result.obb.xyxyxyxy[i].cpu().numpy().astype(np.int32)
+                            
+                            # 원본 프레임 좌표로 변환
+                            obb_points[:, 0] = (obb_points[:, 0] * scale_x).astype(np.int32)
+                            obb_points[:, 1] = (obb_points[:, 1] * scale_y).astype(np.int32)
+                            
+                            # 경계 체크
+                            obb_points[:, 0] = np.clip(obb_points[:, 0], 0, w_orig)
+                            obb_points[:, 1] = np.clip(obb_points[:, 1], 0, h_orig)
+                            
+                            # axis-aligned 바운딩 박스 계산 (기존 호환성 유지)
+                            x1 = int(np.min(obb_points[:, 0]))
+                            y1 = int(np.min(obb_points[:, 1]))
+                            x2 = int(np.max(obb_points[:, 0]))
+                            y2 = int(np.max(obb_points[:, 1]))
+                            
+                            # 패딩 추가 (QR 코드 경계 확보)
+                            pad = 20
+                            x1 = max(0, x1 - pad)
+                            y1 = max(0, y1 - pad)
+                            x2 = min(w_orig, x2 + pad)
+                            y2 = min(h_orig, y2 + pad)
+                            
+                            all_detections.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': conf,
+                                'obb_points': obb_points.tolist()  # OBB 좌표 저장 (시각화용)
+                            })
+                        # xyxy 속성 사용 (fallback)
+                        elif hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
                             xyxy = result.obb.xyxy[i].cpu().numpy()
                             x1, y1, x2, y2 = map(int, xyxy)
                             
@@ -281,24 +312,6 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5,
                             'bbox': [x1, y1, x2, y2],
                             'confidence': conf
                         })
-                    
-                    # 원본 프레임 좌표로 변환
-                    x1 = int(x1 * scale_x)
-                    y1 = int(y1 * scale_y)
-                    x2 = int(x2 * scale_x)
-                    y2 = int(y2 * scale_y)
-                    
-                    # 패딩 추가 (QR 코드 경계 확보)
-                    pad = 20
-                    x1 = max(0, x1 - pad)
-                    y1 = max(0, y1 - pad)
-                    x2 = min(w_orig, x2 + pad)
-                    y2 = min(h_orig, y2 + pad)
-                    
-                    all_detections.append({
-                        'bbox': [x1, y1, x2, y2],
-                        'confidence': conf
-                    })
         
         # Overlap threshold 적용 (NMS) - 중복 제거
         detections = filter_overlapping_detections(all_detections, iou_threshold=iou_threshold)
@@ -336,24 +349,34 @@ def test_single_image(model, image_path, output_dir="test_results", conf_thresho
                                      clahe_clip_limit=clahe_clip_limit)
     detect_time = time.time() - start_time
     
-    # 결과 시각화
+    # 결과 시각화 (최적화: OBB 좌표 직접 사용)
     result_frame = frame.copy()
     
     for i, det in enumerate(detections):
-        x1, y1, x2, y2 = det['bbox']
         conf = det['confidence']
         
-        # 바운딩 박스 그리기 (초록색)
-        cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # OBB 좌표가 있으면 polylines로 그리기 (더 빠름)
+        if 'obb_points' in det and det['obb_points'] is not None:
+            obb_points = np.array(det['obb_points'], dtype=np.int32)
+            # OBB 박스 그리기 (단순 선 그리기로 매우 빠름)
+            cv2.polylines(result_frame, [obb_points.reshape((-1, 1, 2))], isClosed=True, color=(0, 255, 0), thickness=2)
+            # 텍스트 위치는 첫 번째 점 사용
+            text_pos = (int(obb_points[0][0]), int(obb_points[0][1]) - 10)
+        else:
+            # 일반 박스 그리기
+            x1, y1, x2, y2 = det['bbox']
+            cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
         
-        # 신뢰도 표시
+        # 신뢰도 표시 (간단한 텍스트는 cv2.putText 사용 - 더 빠름)
         text = f"QR{i+1}: {conf:.2f}"
-        text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
-        result_frame = put_korean_text(result_frame, text, text_pos, font_size=28, color=(0, 255, 0))
+        if text_pos[1] < 0:
+            text_pos = (text_pos[0], 20)
+        cv2.putText(result_frame, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     
-    # 정보 표시
+    # 정보 표시 (성능 최적화: cv2.putText 사용 - PIL 변환 제거)
     info_text = f"Detections: {len(detections)} | Time: {detect_time*1000:.1f}ms | Conf: {conf_threshold} | IoU: {iou_threshold}"
-    result_frame = put_korean_text(result_frame, info_text, (10, 30), font_size=16, color=(255, 255, 255))
+    cv2.putText(result_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     # 결과 저장
     if save_result:
@@ -545,11 +568,12 @@ def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     print(f"💾 출력 비디오: {output_path}")
     
-    # 화면 표시용 해상도 조정
-    display_width = 1280
-    display_height = 720
-    if width > display_width:
-        scale = display_width / width
+    # 화면 표시용 해상도 조정 (성능 최적화: 큰 영상은 작게 표시)
+    display_width = 960  # 1280 -> 960으로 줄여서 더 빠르게
+    display_height = 540  # 720 -> 540으로 줄여서 더 빠르게
+    if width > display_width or height > display_height:
+        scale = min(display_width / width, display_height / height)
+        display_width = int(width * scale)
         display_height = int(height * scale)
     
     # 통계
@@ -600,32 +624,46 @@ def test_video(model, video_path, output_dir="test_results", conf_threshold=0.25
                     for det in detections:
                         all_confidences.append(det['confidence'])
                 
-                # 결과 시각화
+                # 결과 시각화 (최적화: OBB 좌표 직접 사용, 빠른 그리기)
                 result_frame = frame.copy()
                 
                 for i, det in enumerate(detections):
-                    x1, y1, x2, y2 = det['bbox']
                     conf = det['confidence']
                     
-                    # 바운딩 박스 그리기 (초록색)
-                    cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    # OBB 좌표가 있으면 polylines로 그리기 (더 빠름)
+                    if 'obb_points' in det and det['obb_points'] is not None:
+                        obb_points = np.array(det['obb_points'], dtype=np.int32)
+                        # OBB 박스 그리기 (단순 선 그리기로 매우 빠름)
+                        cv2.polylines(result_frame, [obb_points.reshape((-1, 1, 2))], isClosed=True, color=(0, 255, 0), thickness=2)
+                        # 텍스트 위치는 첫 번째 점 사용
+                        text_pos = (int(obb_points[0][0]), int(obb_points[0][1]) - 10)
+                    else:
+                        # 일반 박스 그리기
+                        x1, y1, x2, y2 = det['bbox']
+                        cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
                     
-                    # 신뢰도 표시
+                    # 신뢰도 표시 (간단한 텍스트는 cv2.putText 사용 - 더 빠름)
                     text = f"QR{i+1}: {conf:.2f}"
-                    text_pos = (x1, y1 - 10) if y1 > 20 else (x1, y2 + 20)
-                    result_frame = put_korean_text(result_frame, text, text_pos, font_size=28, color=(0, 255, 0))
+                    if text_pos[1] < 0:
+                        text_pos = (text_pos[0], 20)
+                    cv2.putText(result_frame, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
-                # 정보 표시
+                # 정보 표시 (간단한 텍스트는 cv2.putText 사용)
                 current_fps = 1.0 / detect_time if detect_time > 0 else 0
                 info_text = f"Frame: {frame_count}/{total_frames} | Detections: {num_detections} | FPS: {current_fps:.1f}"
-                result_frame = put_korean_text(result_frame, info_text, (10, 30), font_size=16, color=(255, 255, 255))
+                cv2.putText(result_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # 비디오 저장 (원본 해상도로)
                 out.write(result_frame)
             
-            # 화면 표시
+            # 화면 표시 (최적화: 리사이즈는 한 번만 수행)
             if show_display and result_frame is not None:
-                display_frame = cv2.resize(result_frame, (display_width, display_height))
+                # 원본이 큰 경우에만 리사이즈 (성능 최적화)
+                if result_frame.shape[1] != display_width or result_frame.shape[0] != display_height:
+                    display_frame = cv2.resize(result_frame, (display_width, display_height))
+                else:
+                    display_frame = result_frame
                 
                 if paused:
                     pause_text = "PAUSED - Press SPACE to resume"
@@ -723,8 +761,14 @@ def main():
     
     print(f"🔍 YOLO 모델 로드 중: {args.model}")
     try:
+        # GPU 사용 시도 (device=0, 없으면 자동으로 CPU 사용)
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         model = YOLO(args.model)
-        print("✅ YOLO 모델 로드 완료")
+        print(f"✅ YOLO 모델 로드 완료")
+        print(f"   Device: {device} ({'GPU 가속' if device == 'cuda' else 'CPU 모드 - GPU를 사용할 수 없습니다'})")
+        if device == 'cuda':
+            print(f"   GPU: {torch.cuda.get_device_name(0)}")
     except Exception as e:
         print(f"❌ YOLO 모델 로드 실패: {e}")
         sys.exit(1)

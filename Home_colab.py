@@ -49,7 +49,7 @@ if IN_COLAB:
     # ============================================================================
     # 🎯 YOLO 모델 경로 설정 (여기서만 수정하면 됩니다!)
     # ============================================================================
-    YOLO_MODEL_PATH = 'model1.pt'  # 다른 모델 테스트 시 여기만 변경하세요 (예: 'l.pt', 'yolov8n.pt' 등)
+    YOLO_MODEL_PATH = 'best.pt'  # 다른 모델 테스트 시 여기만 변경하세요 (예: 'model1.pt', 'yolov8n.pt' 등) - best.pt는 OBB 모델입니다
     
     # 여러 경로에서 모델 파일 찾기
     if not os.path.exists(YOLO_MODEL_PATH):
@@ -130,7 +130,7 @@ def main():
         with st.expander("📋 필요한 파일 및 설정"):
             st.markdown("""
             ### 필수 파일:
-            1. **모델 파일**: `model1.pt` (YOLO 모델)
+            1. **모델 파일**: `best.pt` (YOLO OBB 모델)
             2. **pages 폴더의 파일들**:
                - `pages/1__비디오_QR_탐지.py`
                - `pages/2__이미지_QR_탐지.py`

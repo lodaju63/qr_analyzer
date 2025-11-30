@@ -364,17 +364,80 @@ def decode_with_transformer(image: np.ndarray, model) -> str:
 # ============================================================================
 
 def detect_qr_with_yolo(image: np.ndarray, yolo_model, conf_threshold: float = 0.25) -> List[Dict]:
-    """YOLO로 QR 코드 위치 탐지"""
+    """YOLO로 QR 코드 위치 탐지 (OBB 모델 지원)"""
     try:
         from ultralytics import YOLO
         results = yolo_model(image, conf=conf_threshold, verbose=False)
+        result = results[0]
         
         detections = []
-        if results[0].boxes is not None:
-            for box in results[0].boxes:
+        h, w = image.shape[:2]
+        
+        # OBB 모델 처리 (우선순위 1)
+        if hasattr(result, 'obb') and result.obb is not None and len(result.obb) > 0:
+            for i in range(len(result.obb)):
+                try:
+                    conf = float(result.obb.conf[i])
+                    
+                    # OBB의 xyxyxyxy 속성 사용 (4개 점 좌표 - 회전된 박스)
+                    if hasattr(result.obb, 'xyxyxyxy') and result.obb.xyxyxyxy is not None and len(result.obb.xyxyxyxy) > i:
+                        # OBB의 4개 점 좌표 가져오기 (GPU -> CPU -> Numpy)
+                        obb_points = result.obb.xyxyxyxy[i].cpu().numpy().astype(np.int32)
+                        
+                        # 경계 체크
+                        obb_points[:, 0] = np.clip(obb_points[:, 0], 0, w)
+                        obb_points[:, 1] = np.clip(obb_points[:, 1], 0, h)
+                        
+                        # axis-aligned 바운딩 박스 계산 (기존 호환성 유지)
+                        x1 = int(np.min(obb_points[:, 0]))
+                        y1 = int(np.min(obb_points[:, 1]))
+                        x2 = int(np.max(obb_points[:, 0]))
+                        y2 = int(np.max(obb_points[:, 1]))
+                        
+                        # 패딩 추가 (QR 코드 경계 확보)
+                        pad = 20
+                        x1 = max(0, x1 - pad)
+                        y1 = max(0, y1 - pad)
+                        x2 = min(w, x2 + pad)
+                        y2 = min(h, y2 + pad)
+                        
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': conf,
+                            'obb_points': obb_points.tolist()  # OBB 좌표 저장 (시각화용)
+                        })
+                    # xyxy 속성 사용 (fallback)
+                    elif hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
+                        xyxy = result.obb.xyxy[i].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        
+                        # 패딩 추가 (QR 코드 경계 확보)
+                        pad = 20
+                        x1 = max(0, x1 - pad)
+                        y1 = max(0, y1 - pad)
+                        x2 = min(w, x2 + pad)
+                        y2 = min(h, y2 + pad)
+                        
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': conf
+                        })
+                except Exception as e:
+                    continue
+        
+        # 일반 detection 모델 처리 (우선순위 2)
+        elif result.boxes is not None and len(result.boxes) > 0:
+            for box in result.boxes:
                 conf = float(box.conf[0])
                 xyxy = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = map(int, xyxy)
+                
+                # 패딩 추가 (QR 코드 경계 확보)
+                pad = 20
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
                 
                 detections.append({
                     'bbox': [x1, y1, x2, y2],
@@ -436,7 +499,7 @@ def decode_qr_with_dynamsoft(image: np.ndarray, dbr_reader) -> Tuple[str, Option
 # ============================================================================
 
 def visualize_qr_results(image: np.ndarray, decodings: List[Dict]) -> np.ndarray:
-    """QR 코드 탐지 결과를 이미지에 시각화"""
+    """QR 코드 탐지 결과를 이미지에 시각화 (OBB 모델 지원)"""
     display_image = image.copy()
     
     # 그레이스케일인 경우 BGR로 변환
@@ -450,26 +513,38 @@ def visualize_qr_results(image: np.ndarray, decodings: List[Dict]) -> np.ndarray
         
         x1, y1, x2, y2 = map(int, bbox)
         color = (0, 255, 0) if dec.get('success') else (0, 0, 255)
+        points = None
         
-        # Quad가 있으면 quad 그리기
-        quad = dec.get('quad')
-        if quad and len(quad) == 4:
-            quad_array = np.array(quad, dtype=np.int32)
-            # 정렬 (각도 기준)
-            center = np.mean(quad_array, axis=0)
-            angles = np.arctan2(quad_array[:, 1] - center[1], 
-                              quad_array[:, 0] - center[0])
-            sorted_indices = np.argsort(angles)
-            sorted_quad = quad_array[sorted_indices]
-            cv2.polylines(display_image, [sorted_quad], True, color, 2)
+        # OBB 모델 좌표 우선 사용
+        if 'obb_points' in dec and dec['obb_points'] and len(dec['obb_points']) == 4:
+            obb_points = np.array(dec['obb_points'], dtype=np.int32)
+            cv2.polylines(display_image, [obb_points.reshape((-1, 1, 2))], isClosed=True, color=color, thickness=2)
+            points = obb_points
+        
+        # Quad 사용 (fallback)
+        elif dec.get('quad') and len(dec['quad']) == 4:
+            quad = np.array(dec['quad'])
+            if len(quad) == 4:
+                quad_array = np.array(quad)
+                center = np.mean(quad_array, axis=0)
+                angles = np.arctan2(quad_array[:, 1] - center[1], 
+                                  quad_array[:, 0] - center[0])
+                sorted_indices = np.argsort(angles)
+                sorted_quad = quad_array[sorted_indices]
+                cv2.polylines(display_image, [sorted_quad], True, color, 2)
+                points = sorted_quad
+        
+        # bbox 사용 (최종 fallback)
         else:
-            # Quad가 없으면 bbox 그리기
             cv2.rectangle(display_image, (x1, y1), (x2, y2), color, 2)
+            points = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
         
-        # QR 번호 표시
-        track_id_text = f"#{i}"
-        cv2.putText(display_image, track_id_text, (x1, y1 - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        # QR 번호 표시 (points가 있는 경우)
+        if points is not None and len(points) > 0:
+            track_id_text = f"#{i}"
+            text_pos = (int(points[0][0]), int(points[0][1]) - 10)
+            cv2.putText(display_image, track_id_text, text_pos,
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     
     return display_image
 
@@ -511,7 +586,8 @@ def process_image(image: np.ndarray, preprocessing_options: Dict,
                 'confidence': det['confidence'],
                 'text': text,
                 'quad': quad,
-                'success': len(text) > 0
+                'success': len(text) > 0,
+                'obb_points': det.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
             })
     results['original_decodings'] = original_decodings
     
@@ -552,7 +628,8 @@ def process_image(image: np.ndarray, preprocessing_options: Dict,
                 'confidence': det['confidence'],
                 'text': text,
                 'quad': quad,
-                'success': len(text) > 0
+                'success': len(text) > 0,
+                'obb_points': det.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
             })
     results['preprocessed_decodings'] = preprocessed_decodings
     
@@ -595,7 +672,7 @@ def main():
         if st.button("YOLO 모델 로드", width='stretch'):
             try:
                 from ultralytics import YOLO
-                model_path = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
+                model_path = os.environ.get('YOLO_MODEL_PATH', 'best.pt')  # 기본값: best.pt (OBB 모델)
                 if os.path.exists(model_path):
                     with st.spinner("YOLO 모델 로딩 중..."):
                         st.session_state.yolo_model = YOLO(model_path)

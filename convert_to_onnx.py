@@ -84,7 +84,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='YOLO .pt 모델을 ONNX로 변환')
-    parser.add_argument('--model', type=str, default='l.pt', help='입력 .pt 모델 파일 (기본: l.pt)')
+    parser.add_argument('--model', type=str, default='best.pt', help='입력 .pt 모델 파일 (기본: best.pt, OBB 모델)')
     parser.add_argument('--output', type=str, default=None, help='출력 ONNX 파일 경로 (기본: 자동)')
     parser.add_argument('--imgsz', type=int, default=640, help='입력 이미지 크기 (기본: 640)')
     parser.add_argument('--opset', type=int, default=12, help='ONNX opset 버전 (기본: 12)')
