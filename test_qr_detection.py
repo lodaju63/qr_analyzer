@@ -205,22 +205,82 @@ def detect_qr_with_yolo(model, frame, conf_threshold=0.25, iou_threshold=0.5,
         all_detections = []
         
         for detect_frame in frames_to_detect:
-            # YOLO 탐지
-            results = model(detect_frame, conf=conf_threshold, verbose=False, imgsz=640)
+            # YOLO 탐지 (OBB 모델도 그대로 사용)
+            try:
+                results = model(detect_frame, conf=conf_threshold, verbose=False, imgsz=640)
+            except Exception as e:
+                print(f"⚠️ 탐지 오류 (프레임 스킵): {e}")
+                continue
+            
             result = results[0]
             
-            if result.boxes is not None and len(result.boxes) > 0:
-                h_orig, w_orig = frame.shape[:2]
-                h_detect, w_detect = detect_frame.shape[:2]
-                
-                # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
-                scale_x = w_orig / w_detect if w_detect > 0 else 1.0
-                scale_y = h_orig / h_detect if h_detect > 0 else 1.0
-                
+            # OBB 모델과 일반 detection 모델 모두 지원
+            h_orig, w_orig = frame.shape[:2]
+            h_detect, w_detect = detect_frame.shape[:2]
+            
+            # 스케일 비율 계산 (전처리로 인한 크기 변화 보정)
+            scale_x = w_orig / w_detect if w_detect > 0 else 1.0
+            scale_y = h_orig / h_detect if h_detect > 0 else 1.0
+            
+            # OBB 모델 처리
+            if hasattr(result, 'obb') and result.obb is not None and len(result.obb) > 0:
+                # OBB 모델: result.obb 사용
+                for i in range(len(result.obb)):
+                    try:
+                        conf = float(result.obb.conf[i])
+                        
+                        # OBB의 xyxy 속성 사용 (axis-aligned 바운딩 박스)
+                        if hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
+                            xyxy = result.obb.xyxy[i].cpu().numpy()
+                            x1, y1, x2, y2 = map(int, xyxy)
+                            
+                            # 원본 프레임 좌표로 변환
+                            x1 = int(x1 * scale_x)
+                            y1 = int(y1 * scale_y)
+                            x2 = int(x2 * scale_x)
+                            y2 = int(y2 * scale_y)
+                            
+                            # 패딩 추가 (QR 코드 경계 확보)
+                            pad = 20
+                            x1 = max(0, x1 - pad)
+                            y1 = max(0, y1 - pad)
+                            x2 = min(w_orig, x2 + pad)
+                            y2 = min(h_orig, y2 + pad)
+                            
+                            all_detections.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': conf
+                            })
+                    except Exception as e:
+                        print(f"⚠️ OBB 처리 오류: {e}, 스킵")
+                        continue
+            
+            # 일반 detection 모델 처리
+            elif result.boxes is not None and len(result.boxes) > 0:
                 for box in result.boxes:
                     conf = float(box.conf[0])
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    x1, y1, x2, y2 = map(int, xyxy)
+                    
+                    if hasattr(box, 'xyxy') and box.xyxy is not None and len(box.xyxy) > 0:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        
+                        # 원본 프레임 좌표로 변환
+                        x1 = int(x1 * scale_x)
+                        y1 = int(y1 * scale_y)
+                        x2 = int(x2 * scale_x)
+                        y2 = int(y2 * scale_y)
+                        
+                        # 패딩 추가 (QR 코드 경계 확보)
+                        pad = 20
+                        x1 = max(0, x1 - pad)
+                        y1 = max(0, y1 - pad)
+                        x2 = min(w_orig, x2 + pad)
+                        y2 = min(h_orig, y2 + pad)
+                        
+                        all_detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': conf
+                        })
                     
                     # 원본 프레임 좌표로 변환
                     x1 = int(x1 * scale_x)
@@ -639,7 +699,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='QR 코드 탐지 능력 테스트')
     parser.add_argument('input_path', type=str, help='입력 이미지/비디오 파일 또는 이미지 디렉토리 경로')
-    parser.add_argument('--model', type=str, default='model1.pt', help='YOLO 모델 파일 경로 (기본: model1.pt)')
+    parser.add_argument('--model', type=str, default='best.pt', help='YOLO 모델 파일 경로 (기본: best.pt)')
     parser.add_argument('--output', type=str, default='test_results', help='출력 디렉토리 (기본: test_results)')
     parser.add_argument('--conf', type=float, default=0.25, help='신뢰도 임계값 (기본: 0.25)')
     parser.add_argument('--iou', type=float, default=0.5, help='겹침 임계값 (기본: 0.5)')
