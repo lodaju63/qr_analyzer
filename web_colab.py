@@ -51,22 +51,24 @@ if IN_COLAB:
     # 코랩에서는 /content 디렉토리 사용
     if os.getcwd() != '/content':
         os.chdir('/content')
-    # 모델 파일 경로 확인
-    MODEL_PATH = 'model1.pt'
+    # ============================================================================
+    # 🎯 YOLO 모델 경로 설정 (Home_colab.py에서 설정된 환경 변수 사용)
+    # ============================================================================
+    MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
     if not os.path.exists(MODEL_PATH):
         # 여러 경로에서 모델 파일 찾기
         possible_paths = [
-            '/content/model1.pt',
-            '/content/drive/MyDrive/model1.pt',
-            './model1.pt',
-            'model1.pt'
+            f'/content/{MODEL_PATH}',
+            f'/content/drive/MyDrive/{MODEL_PATH}',
+            f'./{MODEL_PATH}',
+            MODEL_PATH
         ]
         for path in possible_paths:
             if os.path.exists(path):
                 MODEL_PATH = path
                 break
 else:
-    MODEL_PATH = 'model1.pt'
+    MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
 
 # yolo_dynamsoft.py 함수들 import
 try:
@@ -219,15 +221,15 @@ def initialize_models():
     # YOLO 모델 초기화
     if YOLO_AVAILABLE:
         try:
-            # 코랩 환경에서 모델 경로 확인
-            model_path = MODEL_PATH
+            # 코랩 환경에서 모델 경로 확인 (환경 변수 우선 사용)
+            model_path = os.environ.get('YOLO_MODEL_PATH', MODEL_PATH)
             if not os.path.exists(model_path):
                 # 여러 경로에서 모델 파일 찾기
                 possible_paths = [
-                    '/content/model1.pt',
-                    '/content/drive/MyDrive/model1.pt',
-                    './model1.pt',
-                    'model1.pt'
+                    f'/content/{model_path}',
+                    f'/content/drive/MyDrive/{model_path}',
+                    f'./{model_path}',
+                    model_path
                 ]
                 for path in possible_paths:
                     if os.path.exists(path):

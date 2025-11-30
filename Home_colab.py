@@ -46,20 +46,26 @@ if IN_COLAB:
         os.makedirs(pages_dir)
         st.warning("⚠️ `pages` 폴더를 생성했습니다. 필요한 페이지 파일들을 업로드하거나 복사하세요.")
     
-    # 모델 파일 경로 확인
-    MODEL_PATH = 'model1.pt'
-    if not os.path.exists(MODEL_PATH):
-        # 여러 경로에서 모델 파일 찾기
+    # ============================================================================
+    # 🎯 YOLO 모델 경로 설정 (여기서만 수정하면 됩니다!)
+    # ============================================================================
+    YOLO_MODEL_PATH = 'model1.pt'  # 다른 모델 테스트 시 여기만 변경하세요 (예: 'l.pt', 'yolov8n.pt' 등)
+    
+    # 여러 경로에서 모델 파일 찾기
+    if not os.path.exists(YOLO_MODEL_PATH):
         possible_paths = [
-            '/content/model1.pt',
-            '/content/drive/MyDrive/model1.pt',
-            './model1.pt',
-            'model1.pt'
+            f'/content/{YOLO_MODEL_PATH}',
+            f'/content/drive/MyDrive/{YOLO_MODEL_PATH}',
+            f'./{YOLO_MODEL_PATH}',
+            YOLO_MODEL_PATH
         ]
         for path in possible_paths:
             if os.path.exists(path):
-                MODEL_PATH = path
+                YOLO_MODEL_PATH = path
                 break
+    
+    # 환경 변수로 설정하여 다른 파일들이 참조할 수 있도록 함
+    os.environ['YOLO_MODEL_PATH'] = YOLO_MODEL_PATH
 
 # 페이지 설정
 st.set_page_config(

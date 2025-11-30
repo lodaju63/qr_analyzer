@@ -43,6 +43,9 @@ except ImportError:
     YOLO_AVAILABLE = False
     print("⚠️ ultralytics를 사용할 수 없습니다. pip install ultralytics로 설치하세요.")
 
+# YOLO 모델 경로 설정 (환경 변수 또는 기본값)
+YOLO_MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')  # 기본값: model1.pt, 다른 모델 테스트 시 환경 변수로 변경 가능
+
 # PIL import (한글 폰트 지원용)
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -922,7 +925,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     if YOLO_AVAILABLE and use_yolo_mode:
         try:
-            model_path = 'model1.pt'
+            model_path = YOLO_MODEL_PATH
             if os.path.exists(model_path):
                 yolo_model = YOLO(model_path)
                 log_print("✅ YOLO 모델 초기화 완료 (빠른 탐지 모드)")

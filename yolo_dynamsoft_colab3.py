@@ -621,7 +621,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
     
     if YOLO_AVAILABLE and use_yolo_mode:
         try:
-            model_path = 'model1.pt'
+            model_path = YOLO_MODEL_PATH
             if os.path.exists(model_path):
                 import torch
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'

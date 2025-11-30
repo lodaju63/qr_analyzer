@@ -190,7 +190,7 @@ def initialize_models():
     # YOLO 모델 초기화
     if YOLO_AVAILABLE:
         try:
-            model_path = 'model1.pt'
+            model_path = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
             if os.path.exists(model_path):
                 yolo_model = YOLO(model_path)
                 st.success(f"✅ YOLO 모델 로드 완료: {model_path}")

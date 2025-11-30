@@ -595,7 +595,7 @@ def main():
         if st.button("YOLO 모델 로드", width='stretch'):
             try:
                 from ultralytics import YOLO
-                model_path = 'model1.pt'
+                model_path = os.environ.get('YOLO_MODEL_PATH', 'model1.pt')
                 if os.path.exists(model_path):
                     with st.spinner("YOLO 모델 로딩 중..."):
                         st.session_state.yolo_model = YOLO(model_path)
