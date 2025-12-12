@@ -48,3 +48,12 @@ desktop.ini
 uploads/
 outputs/
 cache/
+data/
+output_results/
+video_player_results/
+
+# Old files (Streamlit 등)
+yolo_dynamsoft.py
+img.py
+home.py
+pages/
