@@ -2,6 +2,9 @@
 import sys
 from pathlib import Path
 
+# Fix RecursionError: increase recursion limit
+sys.setrecursionlimit(sys.getrecursionlimit() * 5)
+
 block_cipher = None
 
 # Get ultralytics data files
