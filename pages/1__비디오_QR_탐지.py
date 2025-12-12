@@ -190,7 +190,7 @@ def initialize_models():
     # YOLO 모델 초기화
     if YOLO_AVAILABLE:
         try:
-            model_path = os.environ.get('YOLO_MODEL_PATH', 'best.pt')  # 기본값: best.pt (OBB 모델)
+            model_path = os.environ.get('YOLO_MODEL_PATH', 'model2.pt')  # 기본값: model2.pt (일반 디텍션 모델)
             if os.path.exists(model_path):
                 yolo_model = YOLO(model_path)
                 st.success(f"✅ YOLO 모델 로드 완료: {model_path}")
@@ -418,11 +418,8 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
                 success = False
                 method = "YOLO"
             
-            # OBB 모델 좌표 우선 사용, 없으면 quad_xy, 없으면 bbox
-            if location.get('obb_points') and len(location['obb_points']) == 4:
-                obb_points = np.array(location['obb_points'], dtype=np.int32)
-                cv2.polylines(display_frame, [obb_points.reshape((-1, 1, 2))], isClosed=True, color=color, thickness=2)
-            elif quad_xy and len(quad_xy) == 4:
+            # quad_xy 우선 사용, 없으면 bbox
+            if quad_xy and len(quad_xy) == 4:
                 quad_array = np.array(quad_xy, dtype=np.int32)
                 cv2.polylines(display_frame, [quad_array], True, color, 2)
             else:
@@ -443,8 +440,7 @@ def process_image_file(image_path, conf_threshold, iou_threshold, use_preprocess
                 'frame': 0,
                 'detection': {
                     'bbox_xyxy': location['bbox'],
-                    'quad_xy': quad_xy,
-                    'obb_points': location.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
+                    'quad_xy': quad_xy
                 }
             })
         
@@ -654,7 +650,7 @@ def decode_worker_func_with_ref(dbr_reader, decode_queue, stop_event, session_st
 
 def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                         use_preprocessing, use_clahe, clahe_clip_limit,
-                        detect_both_frames, session_state_ref):
+                        detect_both_frames, frame_interval, session_state_ref):
     """비디오 처리 스레드 - 스레드 안전 버전"""
     # Streamlit 경고 억제 (스레드 내에서)
     import logging
@@ -755,6 +751,7 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
             decode_worker_thread.start()
             session_state_ref['decode_worker_thread'] = decode_worker_thread
         frame_count = 0
+        processed_frame_count = 0  # 실제 처리된 프레임 수
         start_time = time.time()
         fps_counter = 0
         fps_start_time = time.time()
@@ -783,11 +780,18 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
             
             frame_count += 1
             
+            # 프레임 간격에 따라 프레임 스킵
+            if frame_interval > 1 and (frame_count - 1) % frame_interval != 0:
+                # 스킵된 프레임은 출력 비디오에 추가하지 않음
+                continue
+            
+            processed_frame_count += 1
+            
             # 해상도 조정
             display_frame = cv2.resize(frame, (display_width, display_height))
             
-            # 첫 프레임은 즉시 표시 (QR 탐지 전에)
-            if frame_count == 1:
+            # 첫 처리 프레임은 즉시 표시 (QR 탐지 전에)
+            if processed_frame_count == 1:
                 # RGB로 변환하여 저장 (app.py 방식)
                 frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
                 session_state_ref['current_frame'] = frame_rgb
@@ -972,17 +976,8 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
                 color = (0, 255, 0) if qr.get('success') else (0, 0, 255)
                 points = None
                 
-                # OBB 모델 좌표 우선 사용
-                if 'obb_points' in detection and detection['obb_points'] and len(detection['obb_points']) == 4:
-                    obb_points = np.array(detection['obb_points'], dtype=np.float32)
-                    points = obb_points.copy()
-                    points[:, 0] *= scale_x
-                    points[:, 1] *= scale_y
-                    points = points.astype(np.int32)
-                    cv2.polylines(display_frame, [points.reshape((-1, 1, 2))], isClosed=True, color=color, thickness=2)
-                
-                # quad_xy 사용 (fallback)
-                elif 'quad_xy' in detection and detection['quad_xy']:
+                # quad_xy 우선 사용
+                if 'quad_xy' in detection and detection['quad_xy']:
                     quad = np.array(detection['quad_xy'])
                     if len(quad) == 4:
                         quad_array = np.array(quad)
@@ -1164,7 +1159,7 @@ def process_video_thread(video_path, output_dir, conf_threshold, iou_threshold,
 
 def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_threshold,
                               use_preprocessing, use_clahe, clahe_clip_limit,
-                              detect_both_frames, session_state_ref):
+                              detect_both_frames, frame_interval, session_state_ref):
     """여러 파일을 순차적으로 처리하는 스레드"""
     try:
         total_files = len(files_info)
@@ -1257,7 +1252,7 @@ def process_batch_files_thread(files_info, output_dir, conf_threshold, iou_thres
                         target=process_video_thread,
                         args=(file_path, video_output_dir, conf_threshold, iou_threshold,
                              use_preprocessing, use_clahe,
-                             clahe_clip_limit, detect_both_frames, video_session_state),
+                             clahe_clip_limit, detect_both_frames, frame_interval, video_session_state),
                         daemon=True
                     )
                     add_script_run_ctx(video_thread)
@@ -1335,6 +1330,14 @@ def main():
                                             help="원본 프레임과 전처리된 프레임 모두에서 QR 코드를 탐지합니다.")
         else:
             detect_both_frames = True
+        
+        st.markdown("---")
+        st.subheader("비디오 처리 옵션")
+        
+        frame_interval = st.slider("프레임 간격", 
+                                 min_value=1, max_value=30, 
+                                 value=1, step=1,
+                                 help="처리할 프레임 간격을 설정합니다. 1이면 모든 프레임을 처리하고, 2이면 1개씩 건너뛰며, 3이면 2개씩 건너뜁니다. 값이 클수록 처리 속도가 빨라지지만 탐지 정확도가 낮아질 수 있습니다.")
         
         st.markdown("---")
         st.header("📁 파일 업로드")
@@ -1561,7 +1564,7 @@ def main():
                                 target=process_batch_files_thread,
                                 args=(files_info, temp_dir, conf_threshold, iou_threshold,
                                      use_preprocessing, use_clahe,
-                                     clahe_clip_limit, detect_both_frames, st.session_state),
+                                     clahe_clip_limit, detect_both_frames, frame_interval, st.session_state),
                                 daemon=True
                             )
                             add_script_run_ctx(batch_thread)
@@ -1640,7 +1643,7 @@ def main():
                                 target=process_video_thread,
                                 args=(temp_file_path, temp_dir, conf_threshold, iou_threshold,
                                      use_preprocessing, use_clahe, 
-                                     clahe_clip_limit, detect_both_frames, st.session_state),
+                                     clahe_clip_limit, detect_both_frames, frame_interval, st.session_state),
                                 daemon=True
                             )
                             # ★★★ [핵심 수정] 스레드에 Streamlit 컨텍스트 주입

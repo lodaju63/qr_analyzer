@@ -44,7 +44,7 @@ except ImportError:
     print("⚠️ ultralytics를 사용할 수 없습니다. pip install ultralytics로 설치하세요.")
 
 # YOLO 모델 경로 설정 (환경 변수 또는 기본값)
-YOLO_MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'best.pt')  # 기본값: best.pt (OBB 모델), 다른 모델 테스트 시 환경 변수로 변경 가능
+YOLO_MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'model2.pt')  # 기본값: model2.pt (일반 디텍션 모델), 다른 모델 테스트 시 환경 변수로 변경 가능
 
 # PIL import (한글 폰트 지원용)
 try:
@@ -152,70 +152,8 @@ def yolo_detect_qr_locations(model, frame, conf_threshold=0.25, use_preprocessin
             scale_x = w_orig / w_detect if w_detect > 0 else 1.0
             scale_y = h_orig / h_detect if h_detect > 0 else 1.0
             
-            # OBB 모델 처리 (우선순위 1)
-            if hasattr(result, 'obb') and result.obb is not None and len(result.obb) > 0:
-                for i in range(len(result.obb)):
-                    try:
-                        conf = float(result.obb.conf[i])
-                        
-                        # OBB의 xyxyxyxy 속성 사용 (4개 점 좌표 - 회전된 박스)
-                        if hasattr(result.obb, 'xyxyxyxy') and result.obb.xyxyxyxy is not None and len(result.obb.xyxyxyxy) > i:
-                            # OBB의 4개 점 좌표 가져오기 (GPU -> CPU -> Numpy)
-                            obb_points = result.obb.xyxyxyxy[i].cpu().numpy().astype(np.int32)
-                            
-                            # 원본 프레임 좌표로 변환
-                            obb_points[:, 0] = (obb_points[:, 0] * scale_x).astype(np.int32)
-                            obb_points[:, 1] = (obb_points[:, 1] * scale_y).astype(np.int32)
-                            
-                            # 경계 체크
-                            obb_points[:, 0] = np.clip(obb_points[:, 0], 0, w_orig)
-                            obb_points[:, 1] = np.clip(obb_points[:, 1], 0, h_orig)
-                            
-                            # axis-aligned 바운딩 박스 계산 (기존 호환성 유지)
-                            x1 = int(np.min(obb_points[:, 0]))
-                            y1 = int(np.min(obb_points[:, 1]))
-                            x2 = int(np.max(obb_points[:, 0]))
-                            y2 = int(np.max(obb_points[:, 1]))
-                            
-                            # 패딩 추가 (QR 코드 경계 확보)
-                            pad = 20
-                            x1 = max(0, x1 - pad)
-                            y1 = max(0, y1 - pad)
-                            x2 = min(w_orig, x2 + pad)
-                            y2 = min(h_orig, y2 + pad)
-                            
-                            all_locations.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'confidence': conf,
-                                'obb_points': obb_points.tolist()  # OBB 좌표 저장 (시각화용)
-                            })
-                        # xyxy 속성 사용 (fallback)
-                        elif hasattr(result.obb, 'xyxy') and result.obb.xyxy is not None and len(result.obb.xyxy) > i:
-                            xyxy = result.obb.xyxy[i].cpu().numpy()
-                            x1, y1, x2, y2 = map(int, xyxy)
-                            
-                            # 원본 프레임 좌표로 변환
-                            x1 = int(x1 * scale_x)
-                            y1 = int(y1 * scale_y)
-                            x2 = int(x2 * scale_x)
-                            y2 = int(y2 * scale_y)
-                            
-                            # 패딩 추가 (QR 코드 경계 확보)
-                            pad = 20
-                            x1 = max(0, x1 - pad)
-                            y1 = max(0, y1 - pad)
-                            x2 = min(w_orig, x2 + pad)
-                            y2 = min(h_orig, y2 + pad)
-                            
-                            all_locations.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'confidence': conf
-                            })
-                    except Exception as e:
-                        continue
-            
-            # 일반 detection 모델 처리 (우선순위 2)
-            elif result.boxes is not None and len(result.boxes) > 0:
+            # 일반 detection 모델 처리
+            if result.boxes is not None and len(result.boxes) > 0:
                 for box in result.boxes:
                     conf = float(box.conf[0])
                     xyxy = box.xyxy[0].cpu().numpy()
@@ -1547,15 +1485,9 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                         if detection is None:
                             continue
                         
-                        # OBB 모델 좌표 우선 사용, 없으면 quad_xy, 없으면 bbox_xyxy 사용
+                        # quad_xy 우선 사용, 없으면 bbox_xyxy 사용
                         qr_points = None
-                        if 'obb_points' in detection and detection['obb_points'] is not None:
-                            obb_points = np.array(detection['obb_points'], dtype=np.float32)
-                            if len(obb_points) == 4:
-                                # OBB 좌표를 그대로 사용 (이미 정렬되어 있음)
-                                qr_points = np.array([obb_points], dtype=np.float32)
-                        
-                        if qr_points is None and 'quad_xy' in detection and detection['quad_xy'] is not None:
+                        if 'quad_xy' in detection and detection['quad_xy'] is not None:
                             quad = detection['quad_xy']
                             if len(quad) == 4:
                                 quad_array = np.array(quad)
@@ -1616,8 +1548,7 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                 'text': '',  # 아직 해독 안됨
                                 'detection': {
                                     'bbox_xyxy': location['bbox'],
-                                    'quad_xy': None,  # 해독 후 업데이트
-                                    'obb_points': location.get('obb_points', None)  # OBB 모델 좌표 (시각화용)
+                                    'quad_xy': None  # 해독 후 업데이트
                                 },
                                 'method': 'YOLO',
                                 'success': False
@@ -1836,15 +1767,8 @@ def video_player_with_qr(video_path, output_dir="video_player_results",
                                                 # bbox 정보가 없으면 원본 quad_xy 사용
                                                 qr['detection']['quad_xy'] = decode_result['quad_xy']
                             
-                            # OBB 모델 좌표 우선 사용 (회전된 박스 정확히 표시)
-                            if 'obb_points' in detection and detection['obb_points'] is not None:
-                                obb_points = np.array(detection['obb_points'], dtype=np.float32)
-                                if len(obb_points) == 4:
-                                    # OBB 좌표를 그대로 사용 (이미 정렬되어 있음)
-                                    qr_points = np.array([obb_points], dtype=np.float32)
-                            
                             # Dynamsoft 결과 처리 - quad_xy로 정확한 기울어진 형태 사용
-                            elif 'quad_xy' in detection and detection['quad_xy'] is not None:
+                            if 'quad_xy' in detection and detection['quad_xy'] is not None:
                                 # quad_xy 사용 (기울어진 사각형의 4개 꼭짓점)
                                 quad = detection['quad_xy']
                                 if len(quad) == 4:
