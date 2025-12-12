@@ -1,0 +1,126 @@
+name: Build All Platforms
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements_pyqt.txt
+        pip install -r build_requirements.txt
+    
+    - name: Build Windows exe
+      run: |
+        pyinstaller --clean qr_analyzer_onefile.spec
+    
+    - name: Check build
+      run: |
+        if (Test-Path "dist\QR_Analyzer.exe") {
+          Write-Host "✅ Windows build successful!"
+          $size = (Get-Item "dist\QR_Analyzer.exe").Length / 1MB
+          Write-Host "Size: $([math]::Round($size, 2)) MB"
+        } else {
+          Write-Host "❌ Build failed!"
+          exit 1
+        }
+    
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: QR_Analyzer_Windows
+        path: dist/QR_Analyzer.exe
+        retention-days: 7
+
+  build-mac:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements_pyqt.txt
+        pip install -r build_requirements.txt
+    
+    - name: Build Mac app
+      run: |
+        pyinstaller --clean qr_analyzer_onefile_mac.spec
+    
+    - name: Check build
+      run: |
+        if [ -d "dist/QR_Analyzer.app" ]; then
+          echo "✅ Mac build successful!"
+          du -sh dist/QR_Analyzer.app
+        else
+          echo "❌ Build failed!"
+          exit 1
+        fi
+    
+    - name: Create DMG
+      run: |
+        hdiutil create -volname "QR Analyzer" \
+          -srcfolder dist/QR_Analyzer.app \
+          -ov -format UDZO \
+          dist/QR_Analyzer.dmg
+    
+    - name: Upload Mac artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: QR_Analyzer_Mac
+        path: |
+          dist/QR_Analyzer.app
+          dist/QR_Analyzer.dmg
+        retention-days: 7
+
+  create-release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: QR_Analyzer_Windows
+        path: windows
+    
+    - name: Download Mac artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: QR_Analyzer_Mac
+        path: mac
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          windows/QR_Analyzer.exe
+          mac/QR_Analyzer.dmg
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

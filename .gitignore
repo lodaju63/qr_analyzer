@@ -3,57 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+*.egg-info/
+dist/
+build/
+*.spec.bak
+venv/
+env/
+ENV/
 
 # PyInstaller
 *.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-qr_env/
+*.spec~
 
 # IDE
 .vscode/
@@ -64,41 +25,26 @@ qr_env/
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-
-# Project specific
-results/
-video_player_results/
-realtime_results/
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.bmp
-*.tiff
-*.tif
-
-# Model files
-*.pth
-*.pt
-*.onnx
-*.pb
+desktop.ini
 
 # Logs
 *.log
-logs/
 
 # Temporary files
-temp/
-tmp/
 *.tmp
-*.temp
+*.bak
+*.cache
+
+# Test videos and models (큰 파일 제외)
+*.mp4
+*.avi
+*.mov
+*.pt
+*.pth
+*.weights
+
+# User data
+uploads/
+outputs/
+cache/

@@ -1,0 +1,27 @@
+# PyQt6 Desktop App Dependencies
+
+# GUI Framework
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+PyQt6-sip==13.6.0
+
+# Real-time Graph Visualization
+pyqtgraph==0.13.3
+
+# Video Processing
+opencv-python==4.9.0.80
+numpy==1.24.3
+
+# YOLO for QR Detection
+ultralytics==8.1.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Dynamsoft for QR Decoding
+dynamsoft-barcode-reader-bundle>=11.0.0
+
+# Image Processing
+Pillow==10.2.0
+
+# Utilities
+python-dateutil==2.8.2

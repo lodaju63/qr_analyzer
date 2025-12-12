@@ -1,0 +1,2 @@
+# Build requirements for creating standalone executable
+pyinstaller==6.3.0
